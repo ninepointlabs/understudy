@@ -15,6 +15,31 @@ var CATEGORIES = [
   { kind: "appimage", title: "AppImages", icon: "󰀻" }
 ]
 
+// What items are for; the helper gives every item one of these. The order
+// is the order sections are shown in.
+var GROUPS = [
+  { name: "Gaming", icon: "󰊴" },
+  { name: "Dev", icon: "󰅩" },
+  { name: "CLI/TUI", icon: "󰆍" },
+  { name: "Office", icon: "󰈙" },
+  { name: "Media", icon: "󰝚" },
+  { name: "Internet/Communication", icon: "󰖟" },
+  { name: "System/Hardware", icon: "󰘚" },
+  { name: "Themes/Look", icon: "󰏘" },
+  { name: "Other", icon: "󰇘" }
+]
+var REMOVED_KEY = "removed"
+
+function isGroup(name) {
+  for (var i = 0; i < GROUPS.length; i++) if (GROUPS[i].name === name) return true
+  return false
+}
+
+function groupIcon(name) {
+  for (var i = 0; i < GROUPS.length; i++) if (GROUPS[i].name === name) return GROUPS[i].icon
+  return "•"
+}
+
 function isObject(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value)
 }
@@ -57,7 +82,7 @@ function parseScan(text) {
   for (var i = 0; i < s.rows.length; i++) {
     var r = s.rows[i]
     if (!isObject(r) || typeof r.kind !== "string" || typeof r.name !== "string") continue
-    rows.push({ kind: r.kind, name: r.name, note: str(r.note) })
+    rows.push({ kind: r.kind, name: r.name, note: str(r.note), category: isGroup(r.category) ? r.category : "Other" })
   }
   return {
     rows: rows,
@@ -88,12 +113,24 @@ function parseDiff(text) {
       isDefault: it["default"] === true,
       ignored: it.ignored === true,
       hardware: it.hardware === true,
-      isPrivate: it["private"] === true
+      isPrivate: it["private"] === true,
+      category: isGroup(it.category) ? it.category : "Other",
+      skipped: it.skipped === true
     })
+  }
+  var removed = []
+  var rawRemoved = Array.isArray(d.removed) ? d.removed : []
+  for (var r = 0; r < rawRemoved.length; r++) {
+    var x = rawRemoved[r]
+    if (!isObject(x) || typeof x.key !== "string" || typeof x.command !== "string") continue
+    removed.push({ key: x.key, kind: str(x.kind), name: str(x.name) || x.key, command: x.command,
+                   category: isGroup(x.category) ? x.category : "Other" })
   }
   var list = isObject(d.list) ? d.list : {}
   return {
     items: items,
+    removed: removed,
+    skipCategories: Array.isArray(d.skip_categories) ? d.skip_categories.filter(isGroup) : [],
     errors: Array.isArray(d.errors) ? d.errors.filter(function(e) { return typeof e === "string" }) : [],
     label: str(list.label),
     generatedAt: str(list.generated_at)
@@ -121,7 +158,7 @@ function toggle(ticks, item) {
   var on = !(ticks[item.key] === true)
   next[item.key] = on
   var action = ""
-  if (!on && !item.hardware && !item.ignored) action = "ignore"
+  if (!on && !item.hardware && !item.skipped && !item.ignored) action = "ignore"
   else if (on && item.ignored) action = "unignore"
   return { ticks: next, action: action }
 }
@@ -210,11 +247,20 @@ function diffSummary(items, ticks) {
     else manual++
   }
   var picked = selectedKeys(items, ticks).length
+  var skipped = (items || []).filter(function(x) { return x.skipped && x.installable }).length
   return picked + " ticked · " + missing + " missing · " + installed + " here" + (manual ? " · " + manual + " manual" : "")
+    + (skipped ? " · " + skipped + " skipped" : "")
+}
+
+// Plain headers (the by-type view) are labels; sections, items, reminders
+// and category rows can all take the cursor.
+function selectable(row) {
+  return !!row && row.rowType !== "header"
 }
 
 function indexOfKey(rows, key) {
-  for (var i = 0; i < rows.length; i++) if (rows[i].rowType === "item" && rows[i].key === key) return i
+  if (!key) return -1
+  for (var i = 0; i < rows.length; i++) if (selectable(rows[i]) && rows[i].key === key) return i
   return -1
 }
 
@@ -223,7 +269,7 @@ function firstItemIndex(rows, from, step) {
   var i = from
   for (var n = 0; n < rows.length; n++) {
     i = (i + rows.length) % rows.length
-    if (rows[i].rowType === "item") return i
+    if (selectable(rows[i])) return i
     i += step
   }
   return -1
@@ -234,7 +280,7 @@ function nextItemIndex(rows, current, step) {
   var i = current
   for (var n = 0; n < rows.length; n++) {
     i = (i + step + rows.length) % rows.length
-    if (rows[i].rowType === "item") return i
+    if (selectable(rows[i])) return i
   }
   return current
 }
@@ -247,4 +293,165 @@ function installConfirm(count) {
 function lastLine(text) {
   var parts = String(text || "").split("\n").map(function(l) { return l.trim() }).filter(function(l) { return l !== "" })
   return parts.length ? parts[parts.length - 1].replace(/^understudy: /, "") : ""
+}
+
+// ------------------------------------------------------------ categories
+
+// Sections for skipped categories start folded, so the second laptop's list
+// opens without them; what is in them still starts unticked when unfolded.
+function initialCollapsed(skipCategories) {
+  var out = {}
+  for (var i = 0; i < (skipCategories || []).length; i++) out[skipCategories[i]] = true
+  return out
+}
+
+function toggleCollapsed(collapsed, name) {
+  var next = {}
+  for (var k in collapsed) next[k] = collapsed[k]
+  next[name] = !(collapsed && collapsed[name] === true)
+  return next
+}
+
+function plural(n, word) {
+  return n + " " + word + (n === 1 ? "" : "s")
+}
+
+function sectionRow(key, name, icon, note, collapsed, skipped) {
+  return { rowType: "section", key: key, kind: "", name: name, note: note, icon: icon, checkable: false,
+           checked: false, status: "", collapsed: collapsed === true, skipped: skipped === true }
+}
+
+// Rows for the second laptop, by category: a section per category (with how
+// many there are to install and how many are ticked), folded or not, then
+// "Removed on main" last. `opts`: showAll, keep (items ignored this visit),
+// collapsed (name -> true), filter (one category, or ""), skip (names),
+// removed (from parseDiff).
+function buildCategoryRows(items, ticks, opts) {
+  opts = opts || {}
+  var collapsed = opts.collapsed || {}
+  var skip = opts.skip || []
+  var out = []
+  for (var g = 0; g < GROUPS.length; g++) {
+    var group = GROUPS[g]
+    if (opts.filter && opts.filter !== group.name) continue
+    var list = []
+    for (var i = 0; i < (items || []).length; i++) {
+      var it = items[i]
+      if (it.category !== group.name) continue
+      if (!opts.showAll && it.status === "installed") continue
+      if (!opts.showAll && it.ignored && !(opts.keep && opts.keep[it.key])) continue
+      list.push(it)
+    }
+    if (list.length === 0) continue
+    var missing = 0, ticked = 0
+    for (var m = 0; m < list.length; m++) {
+      if (list[m].installable) missing++
+      if (isTicked(ticks, list[m])) ticked++
+    }
+    var skipped = skip.indexOf(group.name) !== -1
+    var note = missing + " to install · " + ticked + " ticked" + (skipped ? " · skipped on this laptop" : "")
+    var folded = collapsed[group.name] === true
+    out.push(sectionRow("cat:" + group.name, group.name + " · " + list.length, group.icon, note, folded, skipped))
+    if (folded) continue
+    for (var j = 0; j < list.length; j++) {
+      var item = list[j]
+      out.push({
+        rowType: "item",
+        key: item.key,
+        kind: item.kind,
+        name: item.name,
+        note: noteFor(item),
+        icon: iconFor(item.kind),
+        checkable: item.installable,
+        checked: isTicked(ticks, item),
+        status: item.status,
+        collapsed: false,
+        skipped: item.skipped === true
+      })
+    }
+  }
+  var removed = (opts.removed || []).filter(function(r) { return !opts.filter || r.category === opts.filter })
+  if (removed.length > 0) {
+    var foldedRemoved = collapsed[REMOVED_KEY] === true
+    out.push(sectionRow(REMOVED_KEY, "Removed on main · " + removed.length, "󰋚",
+                        "still on this laptop · a reminder only, nothing is removed", foldedRemoved, false))
+    if (!foldedRemoved) {
+      for (var r = 0; r < removed.length; r++) {
+        out.push({ rowType: "removed", key: removed[r].key, kind: removed[r].kind, name: removed[r].name,
+                   note: removed[r].category + " · to remove it: " + removed[r].command, icon: iconFor(removed[r].kind),
+                   checkable: false, checked: false, status: "", collapsed: false, skipped: false,
+                   command: removed[r].command })
+      }
+    }
+  }
+  return out
+}
+
+// The main laptop's scan, by category.
+function buildMainCategoryRows(scan, collapsed, filter) {
+  var out = []
+  if (!scan) return out
+  collapsed = collapsed || {}
+  for (var g = 0; g < GROUPS.length; g++) {
+    var group = GROUPS[g]
+    if (filter && filter !== group.name) continue
+    var list = scan.rows.filter(function(r) { return r.category === group.name })
+    if (list.length === 0) continue
+    var folded = collapsed[group.name] === true
+    out.push(sectionRow("cat:" + group.name, group.name + " · " + list.length, group.icon, "", folded, false))
+    if (folded) continue
+    for (var j = 0; j < list.length; j++)
+      out.push({ rowType: "item", key: list[j].kind + ":" + list[j].name, kind: list[j].kind, name: list[j].name,
+                 note: list[j].note, icon: iconFor(list[j].kind), checkable: false, checked: false, status: "",
+                 collapsed: false, skipped: false })
+  }
+  return out
+}
+
+// The category panel: one row per category with how many items it has, a
+// "skip on this laptop" checkbox (the second laptop only), and a first row
+// that shows everything again. Enter on a row shows only that category.
+function buildCategoryPanelRows(entries, skip, filter, withSkip) {
+  var out = [{ rowType: "cat", key: "panel:", name: "All categories", note: filter ? "" : "showing", icon: "󰒺",
+               checkable: false, checked: false, status: "", collapsed: false, skipped: false }]
+  for (var g = 0; g < GROUPS.length; g++) {
+    var group = GROUPS[g]
+    var n = 0, missing = 0
+    for (var i = 0; i < (entries || []).length; i++) {
+      if (entries[i].category !== group.name) continue
+      n++
+      if (entries[i].installable) missing++
+    }
+    var skipped = (skip || []).indexOf(group.name) !== -1
+    var parts = [plural(n, "item")]
+    if (withSkip) parts.push(missing + " to install")
+    if (filter === group.name) parts.unshift("showing only this")
+    if (withSkip && skipped) parts.push("skipped on this laptop")
+    out.push({ rowType: "cat", key: "panel:" + group.name, name: group.name, note: parts.join(" · "), icon: group.icon,
+               checkable: withSkip === true, checked: skipped, status: "", collapsed: false, skipped: skipped })
+  }
+  return out
+}
+
+// Flips one category's skip. Returns the new list (in GROUPS order) and the
+// helper command that remembers it.
+function toggleSkip(skip, name) {
+  if (!isGroup(name)) return { skip: (skip || []).slice(), action: "" }
+  var on = (skip || []).indexOf(name) === -1
+  var next = GROUPS.map(function(g) { return g.name }).filter(function(n) {
+    return n === name ? on : (skip || []).indexOf(n) !== -1
+  })
+  return { skip: next, action: on ? "skip" : "unskip" }
+}
+
+// The section a row is in: its own index for a section, else the nearest
+// section above it, else -1.
+function sectionIndexOf(rows, index) {
+  for (var i = Math.min(index, rows.length - 1); i >= 0; i--) if (rows[i].rowType === "section") return i
+  return -1
+}
+
+function sectionName(row) {
+  if (!row || row.rowType !== "section") return ""
+  return row.key === REMOVED_KEY ? REMOVED_KEY : row.key.replace(/^cat:/, "")
 }

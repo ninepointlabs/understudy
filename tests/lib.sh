@@ -26,12 +26,14 @@ finish() {
 }
 
 ROOT="$(mktemp -d "${TMPDIR:-/tmp}/understudy-test.XXXXXX")"
-trap 'rm -rf "$ROOT"' EXIT
+trap "${KEEP_ROOT:+:} rm -rf \"$ROOT\"" EXIT   # KEEP_ROOT=1 keeps the world for a look
+[[ -n ${KEEP_ROOT:-} ]] && echo "test world: $ROOT" >&2
 H="$ROOT/home"
 OP="$ROOT/omarchy"
 STUB="$ROOT/stub"
 S="$ROOT/state"          # what the stubs answer with
 LOG="$ROOT/calls"
+mkdir -p "$ROOT/usr/share/applications" "$ROOT/flatpak/exports/share/applications" "$S/si" "$S/ql"
 mkdir -p "$H" "$OP/bin" "$OP/install/hardware" "$OP/applications" "$OP/themes/tokyo-night" "$STUB" "$S"
 : >"$LOG"
 
@@ -47,9 +49,14 @@ done
 # Runs the helper in the throwaway world.
 us() {
   env -i HOME="$H" OMARCHY_PATH="$OP" PATH="$STUB:$SYS" LANG=C.UTF-8 \
+    XDG_DATA_DIRS="$ROOT/usr/share" FLATPAK_SYSTEM_DIR="$ROOT/flatpak" \
     UNDERSTUDY_PACMAN_LOG="$S/pacman.log" STUB_STATE="$S" STUB_LOG="$LOG" STUB_HOME="$H" \
     "$HELPER" "$@"
 }
+# So `check "..." bash -c '! "$@"' _ us ...` runs the helper, rather than
+# failing because a function is not a command.
+export -f us
+export H OP STUB S SYS LOG ROOT HELPER
 
 calls() { cat "$LOG"; }
 reset_log() { : >"$LOG"; }
@@ -68,6 +75,13 @@ case "$1" in
   -Qq) cat "$STUB_STATE/installed" ;;
   -Qi) cat "$STUB_STATE/qi" ;;
   -Sl) cat "$STUB_STATE/sl" ;;
+  # One file per package: $STUB_STATE/si/NAME (pacman -Si) and
+  # $STUB_STATE/ql/NAME (the paths pacman -Ql lists).
+  -Si) shift; [[ $1 == -- ]] && shift; rc=0
+    for p in "$@"; do if [[ -f $STUB_STATE/si/$p ]]; then cat "$STUB_STATE/si/$p"; echo; else echo "error: package '"'"'$p'"'"' was not found" >&2; rc=1; fi; done
+    exit $rc ;;
+  -Ql) shift; [[ $1 == -- ]] && shift
+    for p in "$@"; do [[ -f $STUB_STATE/ql/$p ]] && sed "s|^|$p |" "$STUB_STATE/ql/$p"; done; exit 0 ;;
   -Q) [[ $2 == omarchy ]] && echo "omarchy 4.0.6-1" || exit 1 ;;
   *) echo "pacman stub: refusing $*" >&2; exit 1 ;;
 esac'

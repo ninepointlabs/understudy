@@ -1,0 +1,12 @@
+// A menu with Understudy added by hand the ways v0.1 allowed, for tests/menu_test.sh.
+{
+  "personal": {"icon":"","label":"Personal"},
+  "install.understudy": {"icon": "󰑓", "label": "Understudy", "description": "Make this laptop match the main one", "action": "omarchy-shell shell toggle ninepointlabs.understudy"},
+  "install.other": {"icon":"","label":"Other","action":"omarchy-shell shell toggle acme.understudy-helper"},
+  "understudy": {
+    "icon": "󰌢",
+    "label": "Understudy, by hand",
+    "action": "omarchy-shell shell toggle ninepointlabs.understudy"
+  },
+  "personal.notes": {"icon":"󰎞","label":"Notes {understudy}","action":"omarchy-launch-editor ~/notes"}
+}

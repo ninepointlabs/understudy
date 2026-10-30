@@ -60,6 +60,13 @@ extra nvidia-dkms 575 [installed]
 extra vulkan-radeon 25 [installed]
 EOF
 printf '%s\n' core extra multilib g14 >"$S/repos"
+# What pacman -Ql says the packages put where, for their categories: a
+# .desktop file says Office; a program in /usr/bin with no .desktop file is
+# terminal-only.
+printf '%s\n' /usr/bin/ /usr/bin/shared /usr/share/applications/shared.desktop >"$S/ql/shared-first"
+printf '%s\n' /usr/bin/ /usr/bin/my-aur-tool /usr/share/man/man1/my-aur-tool.1.gz >"$S/ql/my-aur-tool"
+printf '[Desktop Entry]\nType=Application\nName=Shared\nCategories=Office;Utility;\n' >"$ROOT/usr/share/applications/shared.desktop"
+printf '[Desktop Entry]\nType=Application\nName=Tool\nCategories=Game;\n' >"$ROOT/flatpak/exports/share/applications/com.example.Tool.desktop"
 printf 'com.example.Tool\tflathub\n' >"$S/flatpaks"
 
 mkdir -p "$H/.local/state/omarchy/done" "$H/.local/state/omarchy/current"
@@ -86,6 +93,7 @@ plugin odd-folder tim.odd "git@github.com:tim/odd.git"
 plugin acme.local acme.local ""
 plugin acme.tallbar acme.tallbar "https://github.com/acme/tallbar.git"
 plugin acme.off acme.off "https://github.com/acme/off.git"
+printf '{"id":"acme.off","name":"acme.off","kinds":["bar-widget"],"description":"Unread e-mail in the bar"}\n' >"$H/.config/omarchy/plugins/acme.off/manifest.json"
 # A backup copy with the same id and no remote must not hide the real one.
 plugin .acme.weather.bak.123 acme.weather ""
 cat >"$S/plugins.json" <<'EOF'
@@ -159,6 +167,28 @@ check "falls back to the plugin folders and shell.json" bash -c 'jq -r "[.rows[]
 check "and says so" bash -c 'jq -r ".warnings[]" <<<"$1" | grep -q "did not answer"' _ "$noshell"
 rm -f "$S/no-shell"
 
+note "categories"
+cat_of() { jq -r --arg n "$1" '.rows[] | select(.name == $n) | .category' <<<"$scan"; }
+check "a known game installer is Gaming" test "$(cat_of omarchy-install-gaming-steam)" = Gaming
+check "the lutris installer is Gaming" test "$(cat_of omarchy-install-gaming-lutris)" = Gaming
+check "a browser installer is Internet/Communication" test "$(cat_of "omarchy-install-browser brave")" = Internet/Communication
+check "the terminal installer is CLI/TUI" test "$(cat_of "omarchy-install-terminal ghostty")" = CLI/TUI
+check "a known CLI tool (btop) is CLI/TUI" test "$(cat_of btop)" = CLI/TUI
+check "a known name (rclone) is Internet/Communication" test "$(cat_of rclone)" = Internet/Communication
+check "a package's .desktop Categories decide when the name is unknown (Office)" test "$(cat_of shared-first)" = Office
+check "a program with no .desktop file is CLI/TUI" test "$(cat_of my-aur-tool)" = CLI/TUI
+check "hardware-specific packages are System/Hardware" bash -c '[[ $(jq -r "[.rows[] | select(.name == \"asusctl\" or .name == \"nvidia-dkms\" or .name == \"vulkan-radeon\" or .name == \"asus-tuf-keyboard-rgb-manager-git\") | .category] | unique | join(\" \")" <<<"$1") == System/Hardware ]]' _ "$scan"
+check "themes are Themes/Look" test "$(jq -r '[.rows[] | select(.kind == "theme") | .category] | unique | join(" ")' <<<"$scan")" = Themes/Look
+check "a whole-bar plugin is Themes/Look" test "$(cat_of acme.tallbar)" = Themes/Look
+check "a plugin's description words decide (e-mail: Internet/Communication)" test "$(cat_of acme.off)" = Internet/Communication
+check "a plugin with nothing to go on is Other" test "$(cat_of acme.weather)" = Other
+check "a web app named for notes is Office" test "$(cat_of Notes)" = Office
+check "a TUI launcher is CLI/TUI" test "$(cat_of Top)" = CLI/TUI
+check "a flatpak's exported .desktop file decides (Game)" test "$(cat_of com.example.Tool)" = Gaming
+check "an AppImage with nothing to go on is Other" test "$(cat_of Other.AppImage)" = Other
+check "every row has exactly one known category" \
+  test "$(jq -r '[.rows[] | select(.category | IN("Gaming","Dev","CLI/TUI","Office","Media","Internet/Communication","System/Hardware","Themes/Look","Other") | not)] | length' <<<"$scan")" = 0
+
 # ---------------------------------------------------------------- export
 
 note "export"
@@ -181,6 +211,8 @@ check "no personal paths in it (HOME, the icon path)" bash -c '! grep -q -e "$2"
 check "the private repo is marked private (anonymous ls-remote refused)" \
   bash -c 'python3 -c "import tomllib,sys; d=tomllib.load(open(sys.argv[1],\"rb\")); t={x[\"name\"]:x for x in d[\"themes\"]}; sys.exit(0 if t[\"secret\"].get(\"private\") and not t[\"sunset\"].get(\"private\") else 1)" "$1"' _ "$L"
 check "the TUI icon path became a plain icon name" grep -q 'icon = "utilities-terminal"' "$L"
+check "main writes each item's category into the list" \
+  python3 -c 'import tomllib,sys; d=tomllib.load(open(sys.argv[1],"rb")); i={x["command"]:x for x in d["installers"]}; t=[x for k in d for x in (d[k] if isinstance(d[k], list) else [])]; sys.exit(0 if i["omarchy-install-gaming-steam"]["category"] == "Gaming" and all("category" in x for x in t) else 1)' "$L"
 check "enabled and bar flags carried" \
   python3 -c 'import tomllib,sys; d={p["id"]:p for p in tomllib.load(open(sys.argv[1],"rb"))["plugins"]}; sys.exit(0 if d["acme.weather"]["enabled"] and not d["acme.off"]["enabled"] and d["tim.odd"]["enabled"] and d["acme.tallbar"].get("bar") else 1)' "$L"
 reset_log
@@ -217,6 +249,7 @@ check "a token as the user name is refused too" bash -c '! "$@" >/dev/null 2>&1'
 echo "https://github.com/acme/omarchy-weather.git" >"$H/.config/omarchy/plugins/acme.weather/.git/origin-url"
 
 note "role and settings"
+check "the helper runs inside bash -c, so the refusal checks below are real" bash -c 'us --help | grep -q "understudy role"'
 check "role starts unset" test "$(us role)" = unset
 us role main >/dev/null
 check "role main is kept in config.toml" grep -qx 'role = "main"' "$H/.config/understudy/config.toml"
@@ -226,5 +259,19 @@ check "a hostile folder is refused" bash -c '! "$@" 2>/dev/null' _ us config fol
 check "status reports the folder" test "$(us status --json | jq -r .folderExists)" = true
 us export --offline >/dev/null
 check "the label goes in the list" grep -qx 'label = "tuf"' "$L"
+
+note "category overrides"
+check "an override is set with understudy category" us category package:btop media
+check "kept in config.toml's [categories] table" bash -c 'grep -qx "\[categories\]" "$1" && grep -qx "\"package:btop\" = \"Media\"" "$1"' _ "$H/.config/understudy/config.toml"
+check "and the other settings are kept" grep -qx 'label = "tuf"' "$H/.config/understudy/config.toml"
+check "the override wins over the built-in mapping" test "$(us scan --json --offline | jq -r '.rows[] | select(.name == "btop") | .category')" = Media
+us export --offline >/dev/null
+check "and main writes it into the list" python3 -c 'import tomllib,sys; d=tomllib.load(open(sys.argv[1],"rb")); sys.exit(0 if {x["name"]:x for x in d["packages"]}["btop"]["category"] == "Media" else 1)' "$L"
+check "an unknown category is refused" bash -c '! "$@" 2>/dev/null' _ us category package:btop Snacks
+check "a bad key is refused" bash -c '! "$@" 2>/dev/null' _ us category 'package:$(id)' Dev
+check "understudy category lists the override" bash -c '"$@" | grep -q "package:btop = Media"' _ us category
+check "--clear takes it out" us category package:btop --clear
+check "and the built-in category is back" test "$(us scan --json --offline | jq -r '.rows[] | select(.name == "btop") | .category')" = CLI/TUI
+check "the config still reads after all that" test "$(us role)" = main
 
 finish

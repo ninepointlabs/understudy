@@ -1,0 +1,43 @@
+# A list as v0.2 of the main laptop writes it: every item has a category.
+format = 1
+generated_at = "2026-10-31T09:00:00Z"
+omarchy_version = "4.0.6-1"
+label = "tuf"
+
+[[installers]]
+command = "omarchy-install-gaming-steam"
+args = []
+packages = ["steam"]
+category = "Gaming"
+
+[[packages]]
+name = "rclone"
+repo = "extra"
+# Main's own choice; the secondary keeps it rather than its built-in mapping.
+category = "Dev"
+
+[[packages]]
+name = "restic"
+repo = "extra"
+# Not a category Understudy knows; worked out again on the secondary.
+category = "Snacks"
+
+[[packages]]
+name = "mixer"
+repo = "extra"
+
+[[packages]]
+name = "mailer"
+repo = "extra"
+
+[[themes]]
+name = "sunset"
+source = "https://github.com/someone/omarchy-sunset-theme.git"
+category = "Themes/Look"
+
+[[plugins]]
+id = "acme.weather"
+name = "Weather"
+source = "https://github.com/acme/omarchy-weather.git"
+enabled = true
+category = "Other"

@@ -21,6 +21,16 @@
                                      open an Omarchy terminal running `apply`
   understudy ignore KEY... | unignore KEY...
                                      stop (or start again) showing items on this machine
+  understudy category [KEY CATEGORY | KEY --clear]
+                                     list categories and overrides, or set or clear one
+  understudy skip [CATEGORY] | unskip CATEGORY
+                                     never offer (or offer again) a category on this machine
+  understudy removed [--json] [--list PATH]
+                                     what main used to list and no longer does (a reminder)
+  understudy dismiss KEY... | undismiss KEY...
+                                     stop (or start again) reminding about a removed item
+  understudy setup omarchy | remove omarchy
+                                     add Understudy to the Omarchy menu, or take it out
 
 Scan and export change nothing but the list file. Apply never removes,
 downgrades or overwrites anything, never runs sudo itself, and asks before it
@@ -58,6 +68,13 @@ CONFIG_FILE = CONFIG_DIR / "config.toml"
 IGNORE_FILE = CONFIG_DIR / "ignore"
 STATE_DIR = Path(os.environ.get("XDG_STATE_HOME") or HOME / ".local/state") / "understudy"
 IMPORTED = STATE_DIR / "imported.toml"
+HISTORY_FILE = STATE_DIR / "history.json"
+MAX_HISTORY_LISTS = 50
+MENU_FILE = HOME / ".config/omarchy/extensions/omarchy-menu.jsonc"
+MENU_BEGIN = "  // >>> understudy — managed by `understudy setup omarchy`, do not edit between the markers"
+MENU_END = "  // <<< understudy"
+DATA_DIRS = [Path(d) for d in (os.environ.get("XDG_DATA_DIRS") or "/usr/local/share:/usr/share").split(":") if d]
+FLATPAK_SYSTEM = Path(os.environ.get("FLATPAK_SYSTEM_DIR") or "/var/lib/flatpak")
 THEMES_DIR = HOME / ".config/omarchy/themes"
 PLUGINS_DIR = HOME / ".config/omarchy/plugins"
 SHELL_JSON = HOME / ".config/omarchy/shell.json"
@@ -126,6 +143,84 @@ HOST_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9-]{0,62}[A-Za-z0-9])?(\.[A-Za-z0-9
 KEY_RE = re.compile(r"^(installer|package|aur|flatpak|theme|plugin|webapp|tui|appimage):[A-Za-z0-9@._+=() -]{1,160}$")
 SECRET_QUERY_RE = re.compile(r"(token|key|secret|pass|auth|sig|session|code|cred)", re.I)
 
+# What each item is for, as opposed to how it installs (the kinds above).
+# Every item gets exactly one; the order is the order they are shown in.
+CATEGORY_NAMES = ["Gaming", "Dev", "CLI/TUI", "Office", "Media", "Internet/Communication",
+                  "System/Hardware", "Themes/Look", "Other"]
+CATEGORY_ALIASES = {
+    "game": "Gaming", "games": "Gaming", "development": "Dev", "cli": "CLI/TUI", "tui": "CLI/TUI",
+    "terminal": "CLI/TUI", "internet": "Internet/Communication", "communication": "Internet/Communication",
+    "network": "Internet/Communication", "system": "System/Hardware", "hardware": "System/Hardware",
+    "themes": "Themes/Look", "theme": "Themes/Look", "look": "Themes/Look",
+}
+
+# Known names win over anything a package says about itself.
+KNOWN_NAMES = {
+    "Gaming": """steam lutris heroic-games-launcher heroic-games-launcher-bin protonup-qt protonup-qt-bin
+        protonplus gamescope mangohud lib32-mangohud gamemode lib32-gamemode goverlay vkbasalt omaforge
+        wine wine-staging wine-mono wine-gecko winetricks protontricks bottles umu-launcher prismlauncher
+        minecraft-launcher retroarch dolphin-emu pcsx2 rpcs3 ppsspp cemu ryujinx bedrock-on-linux-bin
+        dopewars frotz frotz-dumb""",
+    "Dev": """code visual-studio-code-bin vscodium-bin cursor-bin zed docker docker-compose docker-buildx
+        podman github-cli lazygit rustup go nodejs npm pnpm yarn bun-bin deno uv python-pip python-poetry
+        gcc clang cmake meson ninja jdk-openjdk dotnet-sdk ruby mise kubectl helm terraform opentofu
+        postman-bin insomnia-bin android-studio jetbrains-toolbox intellij-idea-community-edition
+        pycharm-community-edition dbeaver sqlitebrowser claude-code opencode emacs helix""",
+    "CLI/TUI": """btop htop fastfetch ripgrep fd fzf bat eza zoxide lazydocker yazi tmux zellij starship jq
+        yq tealdeer tldr glow gum ncdu duf dust""",
+    "Office": """libreoffice-fresh libreoffice-still onlyoffice-bin obsidian xournalpp typora
+        logseq-desktop-bin zathura evince okular""",
+    "Media": """spotify spotify-launcher spotifyd obs-studio vlc mpv gimp inkscape kdenlive krita blender
+        audacity darktable shotcut handbrake pinta imv nomacs""",
+    "Internet/Communication": """signal-desktop discord vesktop slack-desktop zoom telegram-desktop
+        element-desktop thunderbird firefox brave-bin google-chrome chromium zen-browser-bin
+        microsoft-edge-stable-bin tailscale syncthing localsend localsend-bin dropbox transmission-gtk
+        qbittorrent rclone pcloud-drive""",
+    "System/Hardware": """gparted gnome-disk-utility timeshift snapper baobab restic""",
+}
+KNOWN_NAME_CATEGORY = {n: cat for cat, names in KNOWN_NAMES.items() for n in names.split()}
+NAME_PATTERNS = [
+    (r"^(ttf|otf|woff2?)-|^noto-fonts|-fonts?(-git)?$|-icon-theme$|-cursors?(-theme)?$|-gtk-theme$", "Themes/Look"),
+    (r"^(lib32-)?(wine|proton|dxvk|vkd3d)(-|$)", "Gaming"),
+    (r"^(python|ruby|perl|rust|go|haskell|nodejs|mingw-w64)-|-sdk$", "Dev"),
+]
+# Omarchy installers are named for what they set up.
+INSTALLER_PATTERNS = [
+    (r"^omarchy-install-gaming-", "Gaming"),
+    (r"^omarchy-install-(dev-|editor-|ai-|docker-)", "Dev"),
+    (r"^omarchy-install-terminal$", "CLI/TUI"),
+    (r"^omarchy-install-(browser|chromium-|service-(signal|tailscale|dropbox|nordvpn))", "Internet/Communication"),
+    (r"^omarchy-install-service-(spotify|sunshine)", "Media"),
+    (r"^omarchy-install-font", "Themes/Look"),
+    (r"^omarchy-install-service-1password", "System/Hardware"),
+]
+# .desktop Categories, the first that matches deciding.
+DESKTOP_CATEGORIES = [
+    ({"Game"}, "Gaming"),
+    ({"Development", "IDE"}, "Dev"),
+    ({"TerminalEmulator"}, "CLI/TUI"),
+    ({"Office"}, "Office"),
+    ({"AudioVideo", "Audio", "Video", "Graphics"}, "Media"),
+    ({"Network", "Chat", "Email", "WebBrowser", "InstantMessaging"}, "Internet/Communication"),
+    ({"System", "Settings", "HardwareSettings"}, "System/Hardware"),
+]
+GROUP_CATEGORIES = [
+    (r"^base-devel$|^qt\d|^kf\d", "Dev"),
+    (r"^(pro-audio|gstreamer)", "Media"),
+    (r"^(xorg-drivers|lib32-)", "System/Hardware"),
+    (r"^texlive", "Office"),
+    (r"fonts$", "Themes/Look"),
+]
+KEYWORD_CATEGORIES = [
+    (r"\b(game|games|gaming|emulator|proton|steam|warcraft|wow)\b", "Gaming"),
+    (r"\b(ide|compiler|programming|debugger|sdk|toolchain|language server|development|developer)\b", "Dev"),
+    (r"\b(office|document|spreadsheet|word processor|pdf|notes?|e-?book|reader)\b", "Office"),
+    (r"\b(music|audio|video|player|image|photo|graphics|media|screen ?cast|stream(ing)?)\b", "Media"),
+    (r"\b(browser|chat|e-?mail|mail|messag\w*|vpn|sync\w*|cloud|torrent|web|network)\b", "Internet/Communication"),
+    (r"\b(hardware|driver|firmware|keyboard|rgb|battery|fan|gpu|system|backup|disk)\b", "System/Hardware"),
+    (r"\b(theme|icons?|cursors?|fonts?|wallpapers?|look|style|colou?rs?)\b", "Themes/Look"),
+]
+
 
 class Fail(Exception):
     def __init__(self, message, code=1):
@@ -184,6 +279,137 @@ def is_hardware_name(name):
     return any(re.search(p, name) for p in HARDWARE_PATTERNS)
 
 
+def canon_category(value):
+    """The category a name means (any case, or a short alias), or ''."""
+    if not isinstance(value, str):
+        return ""
+    v = value.strip().lower()
+    for c in CATEGORY_NAMES:
+        if v == c.lower():
+            return c
+    return CATEGORY_ALIASES.get(v, "")
+
+
+def item_key(kind, item):
+    """The key of an item as scan finds it (load_list makes the same ones)."""
+    if kind == "installer":
+        return f"installer:{item['command']}" + ("=" + item["args"][0] if item.get("args") else "")
+    return f"{kind}:{item.get('id') or item.get('name')}"
+
+
+def categorize(kind, item, facts=None):
+    """The built-in category of an item: known names, then hardware, then
+    what its .desktop file says, then terminal-only programs, then pacman
+    groups, then words in its description, then Other. Overrides are applied
+    by the caller, before this."""
+    facts = facts or {}
+    if kind == "theme":
+        return "Themes/Look"
+    if kind == "tui":
+        return "CLI/TUI"
+    names = []
+    if kind == "installer":
+        names = [item["packages"][0]] if item.get("packages") else []
+    elif kind == "plugin":
+        pid = item.get("id") or item.get("name") or ""
+        names = [pid.rsplit(".", 1)[-1].lower(), pid.lower()]
+    else:
+        names = [str(item.get("id") or item.get("name") or "").lower()]
+        if kind == "flatpak":
+            names.append(names[0].rsplit(".", 1)[-1])
+    for n in names:
+        if n in KNOWN_NAME_CATEGORY:
+            return KNOWN_NAME_CATEGORY[n]
+    if kind == "installer":
+        for pattern, cat in INSTALLER_PATTERNS:
+            if re.search(pattern, item.get("command", "")):
+                return cat
+    for n in names:
+        for pattern, cat in NAME_PATTERNS:
+            if re.search(pattern, n):
+                return cat
+    if item.get("hardware"):
+        return "System/Hardware"
+    desktop = set(facts.get("desktop") or [])
+    for wanted, cat in DESKTOP_CATEGORIES:
+        if desktop & wanted:
+            return cat
+    if facts.get("terminal") or (facts.get("has_bin") and not facts.get("has_desktop")):
+        return "CLI/TUI"
+    for g in facts.get("groups") or []:
+        for pattern, cat in GROUP_CATEGORIES:
+            if re.search(pattern, g):
+                return cat
+    words = " ".join([facts.get("desc") or "", str(item.get("label") or item.get("name") or "")])
+    if kind == "plugin" and ("bar" in (item.get("kinds") or []) or item.get("bar")):
+        return "Themes/Look"
+    for pattern, cat in KEYWORD_CATEGORIES:
+        if re.search(pattern, words, re.I):
+            return cat
+    if kind == "webapp":
+        return "Internet/Communication"
+    return "Other"
+
+
+def desktop_facts(paths):
+    """What a package's .desktop files say: their Categories, and whether
+    they run in a terminal. `paths` are the names of the files."""
+    cats, terminal, found = set(), False, False
+    for name in paths:
+        for d in DATA_DIRS:
+            f = d / "applications" / name
+            if f.is_file():
+                entry = read_desktop(f)
+                if entry.get("NoDisplay", "").lower() == "true" or entry.get("Type", "Application") != "Application":
+                    break
+                found = True
+                cats |= {c for c in entry.get("Categories", "").split(";") if c}
+                terminal = terminal or entry.get("Terminal", "").lower() == "true"
+                break
+    return {"desktop": sorted(cats), "terminal": terminal, "has_desktop": found}
+
+
+def package_facts(names, installed=True, info=None):
+    """name -> facts for categorize(), for packages. Installed packages are
+    read with `pacman -Qi` and `-Ql` (description, groups, their .desktop
+    files and whether they put anything in /usr/bin); packages that are not
+    installed with `pacman -Si` (description and groups only)."""
+    names = sorted({n for n in names if PKG_RE.match(n)})
+    out = {n: {} for n in names}
+    if not names:
+        return out
+    if info is None:
+        info = pacman_info(names, sync=not installed)
+    for n in names:
+        p = info.get(n)
+        if p:
+            out[n]["desc"] = p["desc"]
+            out[n]["groups"] = p["groups"]
+    if installed:
+        files = {}
+        for line in lines(["pacman", "-Ql", "--"] + names, timeout=60) or []:
+            pkg, _, path = line.partition(" ")
+            files.setdefault(pkg, []).append(path)
+        for n in names:
+            paths = files.get(n, [])
+            apps = [p.rsplit("/", 1)[-1] for p in paths
+                    if p.startswith("/usr/share/applications/") and p.endswith(".desktop")]
+            out[n].update(desktop_facts(apps))
+            out[n]["has_bin"] = any(p.startswith("/usr/bin/") and not p.endswith("/") for p in paths)
+    return out
+
+
+def flatpak_facts(app_id):
+    for d in (FLATPAK_SYSTEM, HOME / ".local/share/flatpak"):
+        f = d / "exports/share/applications" / f"{app_id}.desktop"
+        if f.is_file():
+            entry = read_desktop(f)
+            cats = sorted({c for c in entry.get("Categories", "").split(";") if c})
+            return {"desktop": cats, "terminal": entry.get("Terminal", "").lower() == "true", "has_desktop": True,
+                    "desc": entry.get("Comment", "")}
+    return {}
+
+
 def theme_slug(url):
     """The folder `omarchy theme install` clones a URL into."""
     path = url
@@ -200,7 +426,8 @@ def theme_slug(url):
 # ------------------------------------------------------------------- config
 
 def read_config():
-    cfg = {"role": "", "folder": DEFAULT_FOLDER, "label": "main", "auto_export": False}
+    cfg = {"role": "", "folder": DEFAULT_FOLDER, "label": "main", "auto_export": False,
+           "skip_categories": [], "dismissed": [], "categories": {}}
     if CONFIG_FILE.is_file():
         try:
             data = tomllib.loads(CONFIG_FILE.read_text())
@@ -214,6 +441,16 @@ def read_config():
             cfg["label"] = data["label"]
         if isinstance(data.get("auto_export"), bool):
             cfg["auto_export"] = data["auto_export"]
+        skip = data.get("skip_categories")
+        if isinstance(skip, list):
+            cfg["skip_categories"] = [c for c in CATEGORY_NAMES if c in {canon_category(x) for x in skip}]
+        dismissed = data.get("dismissed")
+        if isinstance(dismissed, list):
+            cfg["dismissed"] = sorted({k for k in dismissed if isinstance(k, str) and KEY_RE.match(k)})
+        cats = data.get("categories")
+        if isinstance(cats, dict):
+            cfg["categories"] = {k: canon_category(v) for k, v in sorted(cats.items())
+                                 if KEY_RE.match(k) and canon_category(v)}
     return cfg
 
 
@@ -225,6 +462,13 @@ def write_config(cfg):
         f"folder = {toml_str(cfg['folder'])}\n"
         f"label = {toml_str(cfg['label'])}\n"
         f"auto_export = {'true' if cfg['auto_export'] else 'false'}\n"
+        "# Categories never offered on this machine: `understudy skip` / `unskip`.\n"
+        f"skip_categories = {toml_value(cfg['skip_categories'])}\n"
+        "# Items no longer on main that you were reminded about: `understudy dismiss` / `undismiss`.\n"
+        f"dismissed = {toml_value(cfg['dismissed'])}\n"
+        "\n# Your own category for an item, over Understudy's: `understudy category KEY CATEGORY`.\n"
+        "[categories]\n"
+        + "".join(f"{toml_str(k)} = {toml_str(v)}\n" for k, v in sorted(cfg["categories"].items()))
     )
     atomic_write(CONFIG_FILE, text)
 
@@ -394,11 +638,14 @@ def package_list_file(name):
     return out
 
 
-def pacman_info():
-    """name -> {deps, provides} for every installed package."""
-    rc, out, _ = run(["pacman", "-Qi"], timeout=120, env=c_env())
+def pacman_info(names=None, sync=False):
+    """name -> {deps, provides, groups, desc} for every installed package
+    (`pacman -Qi`), or for the named ones in the sync repos (`pacman -Si`)."""
+    argv = ["pacman", "-Si" if sync else "-Qi"] + (["--"] + list(names) if names else [])
+    rc, out, _ = run(argv, timeout=120, env=c_env())
     pkgs = {}
-    if rc != 0:
+    # -Si exits 1 when any one name is not in a repo, and still prints the rest.
+    if rc != 0 and not (sync and out):
         return pkgs
     cur, field = None, None
     for raw in out.splitlines():
@@ -413,7 +660,11 @@ def pacman_info():
         else:
             continue
         if field == "Name":
-            cur = pkgs.setdefault(value, {"deps": [], "provides": []})
+            cur = pkgs.setdefault(value, {"deps": [], "provides": [], "groups": [], "desc": ""})
+        elif cur is not None and field == "Description":
+            cur["desc"] = value[:300]
+        elif cur is not None and field == "Groups" and value != "None":
+            cur["groups"] += value.split()
         elif cur is not None and field in ("Depends On", "Provides") and value != "None":
             key = "deps" if field == "Depends On" else "provides"
             cur[key] += [re.split(r"[<>=]", t, maxsplit=1)[0] for t in value.split()]
@@ -667,7 +918,8 @@ def plugin_folders():
         try:
             m = json.loads((d / "manifest.json").read_text())
             if isinstance(m, dict) and isinstance(m.get("id"), str):
-                out.setdefault(m["id"], {"dir": d, "name": m.get("name") or "", "kinds": m.get("kinds") or []})
+                out.setdefault(m["id"], {"dir": d, "name": m.get("name") or "", "kinds": m.get("kinds") or [],
+                                         "description": str(m.get("description") or "")[:300]})
         except (OSError, ValueError):
             continue
     return out
@@ -812,6 +1064,24 @@ def scan(offline=False):
             if len(parts) >= 2 and FLATPAK_ID_RE.match(parts[0]) and REMOTE_RE.match(parts[1]):
                 flatpaks.append({"id": parts[0], "remote": parts[1]})
 
+    found = {"installers": installers, "packages": packages, "aur": aur, "flatpaks": flatpaks, "themes": themes,
+             "plugins": plugins, "webapps": webapps, "tuis": tuis, "appimages": scan_appimages()}
+    facts = package_facts([i["packages"][0] for i in installers] + [x["name"] for x in packages + aur], info=info)
+    overrides = read_config()["categories"]
+    for table, kind, _ in CATEGORIES:
+        for it in found[table]:
+            if kind in ("package", "aur"):
+                f = facts.get(it["name"])
+            elif kind == "installer":
+                f = facts.get(it["packages"][0])
+            elif kind == "flatpak":
+                f = flatpak_facts(it["id"])
+            elif kind == "plugin":
+                f = {"desc": folders[it["id"]]["description"]} if it["id"] in folders else {}
+            else:
+                f = {}
+            it["category"] = overrides.get(item_key(kind, it)) or categorize(kind, it, f)
+
     first_install = ""
     try:
         first_install = datetime.date.fromtimestamp((OMARCHY_STATE / "done/first-run-user").stat().st_mtime).isoformat()
@@ -822,15 +1092,7 @@ def scan(offline=False):
         "omarchy_version": omarchy_version(),
         "first_install": first_install,
         "counts": {"explicit": len(explicit), "beyond_defaults": len(explicit - defaults), "foreign": len(foreign)},
-        "installers": installers,
-        "packages": packages,
-        "aur": aur,
-        "flatpaks": flatpaks,
-        "themes": themes,
-        "plugins": plugins,
-        "webapps": webapps,
-        "tuis": tuis,
-        "appimages": scan_appimages(),
+        **found,
         "warnings": warnings,
     }
 
@@ -981,6 +1243,9 @@ def validate_entry(kind, e):
         elif kind == "appimage":
             item["name"] = s("name", APPIMAGE_RE)
             item["manual"] = True
+        # Optional (v0.1 lists have none); one Understudy does not know is
+        # worked out here instead.
+        item["category"] = canon_category(e.get("category")) if e.get("category") in CATEGORY_NAMES else ""
         item["key"] = f"{kind}:{item['name']}"
         if not KEY_RE.match(item["key"]):
             raise ValueError("name has characters Understudy does not accept")
@@ -1142,18 +1407,194 @@ def short_url(url):
     return re.sub(r"^https://(www\.)?", "", url)
 
 
-def diff(path):
+def diff(path, cfg=None, here=None):
+    """Reads the list and says, per item, what it is here. An item in a
+    category this machine skips is never ticked by default; it can still be
+    ticked by hand (passed with --only)."""
+    cfg = cfg or read_config()
     doc, items, errors = load_list(path)
-    here = Here()
+    here = here or Here()
     ignored = read_ignore()
     for it in items:
         assess(it, here)
         it["ignored"] = it["key"] in ignored
-        it["default"] = it["installable"] and not it["hardware"] and not it["ignored"]
+    set_categories(items, cfg, here)
+    skip = set(cfg["skip_categories"])
+    for it in items:
+        it["skipped"] = it["category"] in skip
+        it["default"] = it["installable"] and not it["hardware"] and not it["ignored"] and not it["skipped"]
     return doc, items, errors
 
 
+def set_categories(items, cfg, here):
+    """This machine's override, else main's category, else worked out here
+    (lists from v0.1 have none)."""
+    overrides = cfg["categories"]
+    todo = [it for it in items if not overrides.get(it["key"]) and not it["category"]]
+    names = [it["packages"][0] if it["kind"] == "installer" else it["name"]
+             for it in todo if it["kind"] in ("installer", "package", "aur")]
+    facts = {}
+    if names:
+        local = [n for n in names if n in here.packages]
+        facts.update(package_facts([n for n in names if n not in here.packages and n in here.sync], installed=False))
+        facts.update(package_facts(local))
+    for it in items:
+        if overrides.get(it["key"]):
+            it["category"], it["category_from"] = overrides[it["key"]], "override"
+            continue
+        if it["category"]:
+            it["category_from"] = "list"
+            continue
+        f = {}
+        if it["kind"] in ("package", "aur"):
+            f = facts.get(it["name"], {})
+        elif it["kind"] == "installer":
+            f = facts.get(it["packages"][0], {})
+        elif it["kind"] == "flatpak":
+            f = flatpak_facts(it["name"])
+        it["category"], it["category_from"] = categorize(it["kind"], it, f), "here"
+
+
+# ------------------------------------------------- what main used to list
+
+def read_history():
+    """The lists from main this machine has read: when each was written and
+    which item keys it had, plus enough about each item to name it."""
+    hist = {"lists": [], "items": {}}
+    try:
+        data = json.loads(HISTORY_FILE.read_text())
+    except (OSError, ValueError, UnicodeDecodeError):
+        return hist
+    if not isinstance(data, dict):
+        return hist
+    for entry in data.get("lists") or []:
+        if isinstance(entry, dict) and printable(entry.get("generated_at"), 40) and isinstance(entry.get("keys"), list):
+            hist["lists"].append({"generated_at": entry["generated_at"],
+                                  "label": entry["label"] if printable(entry.get("label"), 40) else "",
+                                  "keys": [k for k in entry["keys"] if isinstance(k, str) and KEY_RE.match(k)]})
+    items = data.get("items")
+    if isinstance(items, dict):
+        for k, v in items.items():
+            if isinstance(k, str) and KEY_RE.match(k) and isinstance(v, dict):
+                hist["items"][k] = {f: v[f] for f in ("kind", "name", "category", "package") if printable(v.get(f), 160)}
+    return hist
+
+
+def record_history(doc, items):
+    """Remembers what a list had, once per list (by when it was written).
+    Keeps the last MAX_HISTORY_LISTS lists."""
+    stamp = doc.get("generated_at")
+    if not stamp:
+        return False
+    hist = read_history()
+    if any(entry["generated_at"] == stamp for entry in hist["lists"]):
+        return False
+    hist["lists"].append({"generated_at": stamp, "label": doc.get("label") or "", "keys": sorted(it["key"] for it in items)})
+    hist["lists"] = sorted(hist["lists"], key=lambda entry: entry["generated_at"])[-MAX_HISTORY_LISTS:]
+    for it in items:
+        info = {"kind": it["kind"], "name": it["name"], "category": it.get("category") or ""}
+        if it["kind"] == "installer":
+            info["package"] = it["packages"][0]
+        hist["items"][it["key"]] = info
+    live = {k for entry in hist["lists"] for k in entry["keys"]}
+    hist["items"] = {k: v for k, v in sorted(hist["items"].items()) if k in live}
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    atomic_write(HISTORY_FILE, json.dumps({"version": 1, **hist}, indent=1) + "\n")
+    return True
+
+
+def remember_list(path):
+    """Records a list in the history without failing the caller."""
+    try:
+        stamp = str(tomllib.loads(Path(path).read_text()).get("generated_at", ""))
+        if not stamp or any(e["generated_at"] == stamp for e in read_history()["lists"]):
+            return
+        doc, items, _ = load_list(path)
+        record_history(doc, items)
+    except (Fail, OSError, tomllib.TOMLDecodeError, UnicodeDecodeError):
+        pass
+
+
+NAME_CHECK = {"installer": INSTALLER_RE, "package": PKG_RE, "aur": PKG_RE, "flatpak": FLATPAK_ID_RE, "theme": THEME_RE,
+              "plugin": ID_RE, "webapp": APP_NAME_RE, "tui": APP_NAME_RE, "appimage": APPIMAGE_RE}
+
+
+def removed_on_main(doc, items, cfg, here):
+    """Items an older list from main had and the current one does not, that
+    are on this machine (installed explicitly, and not an Omarchy default
+    here). A reminder only: each comes with the command that would remove
+    it, which Understudy never runs."""
+    hist = read_history()
+    stamp = doc.get("generated_at") or ""
+    current = {it["key"] for it in items}
+    past = {k for entry in hist["lists"] if not stamp or entry["generated_at"] < stamp for k in entry["keys"]}
+    candidates = sorted(past - current - set(cfg["dismissed"]))
+    if not candidates:
+        return []
+    explicit, defaults, plugins = None, None, None
+    out = []
+    for key in candidates:
+        info = hist["items"].get(key) or {}
+        kind, name = info.get("kind"), info.get("name", "")
+        if kind not in NAME_CHECK or f"{kind}:{name}" != key:
+            continue
+        if kind == "installer":
+            name_ok = INSTALLER_RE.match(name.split("=", 1)[0]) is not None
+        else:
+            name_ok = NAME_CHECK[kind].match(name) is not None
+        if not name_ok:
+            continue
+        if kind in ("installer", "package", "aur"):
+            pkg = info.get("package", "") if kind == "installer" else name
+            if not PKG_RE.match(pkg):
+                continue
+            if explicit is None:
+                explicit = set(lines(["pacman", "-Qqe"]) or [])
+            if pkg not in explicit:
+                continue
+            if defaults is None:
+                defaults = defaults_set(pacman_info())
+            if pkg in defaults:
+                continue
+            command = shlex.join(["omarchy", "pkg", "drop", pkg])
+        elif kind == "theme":
+            if not (THEMES_DIR / name).is_dir():
+                continue
+            command = shlex.join(["omarchy", "theme", "remove", name])
+        elif kind == "plugin":
+            if plugins is None:
+                plugins = set(plugin_folders())
+            if name.startswith("omarchy.") or name not in plugins:
+                continue
+            command = shlex.join(["omarchy", "plugin", "remove", name])
+        elif kind in ("webapp", "tui"):
+            if not (APPS_DIR / f"{name}.desktop").is_file():
+                continue
+            command = shlex.join(["omarchy", kind, "remove", name])
+        elif kind == "flatpak":
+            if name not in here.flatpaks:
+                continue
+            command = shlex.join(["flatpak", "uninstall", name])
+        else:
+            folder = next((d for d in (HOME / "Applications", HOME / ".local/bin") if (d / name).is_file()), None)
+            if folder is None:
+                continue
+            command = "rm " + tilde(folder) + "/" + shlex.quote(name)
+        stub = {"name": name, "command": name.split("=", 1)[0], "packages": [info.get("package", "")]}
+        category = cfg["categories"].get(key) or canon_category(info.get("category")) or categorize(kind, stub)
+        out.append({"key": key, "kind": kind, "name": name, "category": category, "command": command})
+    return out
+
+
 # ----------------------------------------------------------------- the plan
+
+def left_out(items, only):
+    """What the default selection leaves out only because its category is
+    skipped here."""
+    if only is not None:
+        return []
+    return [it for it in items if it["skipped"] and it["installable"] and not it["hardware"] and not it["ignored"]]
+
 
 def select(items, only):
     if only is None:
@@ -1221,10 +1662,15 @@ def shown(argv):
     return shlex.join(argv)
 
 
-def plan_text(groups, list_path, doc, errors):
+def plan_text(groups, list_path, doc, errors, left_out=None):
     out = [f"Understudy plan from {tilde(list_path)} (label {doc['label'] or '?'}, {doc['generated_at'] or 'undated'})", ""]
     if not groups:
         out.append("Nothing to install.")
+    if left_out:
+        cats = sorted({it["category"] for it in left_out}, key=CATEGORY_NAMES.index)
+        out.append(f"Left out: {len(left_out)} item{'s' if len(left_out) != 1 else ''} in categories this machine skips "
+                   f"({', '.join(cats)}). Tick them by hand to add them.")
+        out.append("")
     prev = current_theme()
     for g in groups:
         out.append(f"{g['title']}:")
@@ -1309,7 +1755,7 @@ def apply(list_path, only, hold):
     doc, items, errors = diff(list_path)
     chosen = select(items, only)
     groups = build_plan(chosen)
-    sys.stdout.write(plan_text(groups, list_path, doc, errors))
+    sys.stdout.write(plan_text(groups, list_path, doc, errors, left_out(items, only)))
     if not groups:
         return finish(0, hold)
     sys.stdout.write("Nothing is removed or replaced; anything already here is skipped.\n")
@@ -1433,7 +1879,8 @@ def scan_rows(found):
                 notes.append(it["url"])
             if kind == "tui":
                 notes.append(it["command"])
-            rows.append({"kind": kind, "name": name, "note": " · ".join(notes)})
+            rows.append({"kind": kind, "name": name, "note": " · ".join(notes), "category": it.get("category", "Other"),
+                         "key": item_key(kind, it)})
     return rows
 
 
@@ -1453,7 +1900,7 @@ def cmd_scan(args):
         items = [r for r in scan_rows(found) if r["kind"] == kind]
         print(f"{title}: {len(items)}")
         for r in items:
-            print(f"  {r['name']}" + (f"  ({r['note']})" if r["note"] else ""))
+            print(f"  {r['name']}  [{r['category']}]" + (f"  ({r['note']})" if r["note"] else ""))
     for w in found["warnings"]:
         print("warning: " + w)
     return 0
@@ -1518,6 +1965,7 @@ def cmd_import(args):
     with open(src, "rb") as f:
         raw = f.read(MAX_LIST_BYTES)
     atomic_write(IMPORTED, raw.decode("utf-8"))
+    record_history(doc, items)
     print(f"Imported {len(items)} items from {tilde(src)} (label {doc['label'] or '?'}, {doc['generated_at'] or 'undated'}).")
     for e in errors:
         print("skipped: " + e)
@@ -1539,56 +1987,95 @@ def parse_common(args):
             break
         rest.append(a)
         i += 1
+    explicit = list_path is not None
     if list_path is None:
         list_path = default_list_path(read_config())
-    return list_path, only, rest
+    return list_path, only, rest, explicit
+
+
+DIFF_FIELDS = ("key", "kind", "name", "label", "status", "note", "installable", "default", "ignored", "hardware",
+               "private", "category", "category_from", "skipped")
 
 
 def cmd_diff(args):
-    list_path, _, rest = parse_common(args)
-    doc, items, errors = diff(list_path)
+    list_path, _, rest, explicit = parse_common(args)
+    cfg, here = read_config(), Here()
+    doc, items, errors = diff(list_path, cfg, here)
+    removed = removed_on_main(doc, items, cfg, here)
+    # The lists this machine reads from main are its history; a list named
+    # with --list is a one-off and is not remembered.
+    if not explicit:
+        if IMPORTED.is_file() and Path(list_path) != IMPORTED:
+            remember_list(IMPORTED)
+        record_history(doc, items)
     if "--json" in rest:
         print(json.dumps({"list": {"path": str(list_path), **doc}, "errors": errors,
-                          "items": [{k: it.get(k) for k in ("key", "kind", "name", "label", "status", "note",
-                                                             "installable", "default", "ignored", "hardware", "private")}
-                                    for it in items]}))
+                          "categories": CATEGORY_NAMES, "skip_categories": cfg["skip_categories"],
+                          "items": [{k: it.get(k) for k in DIFF_FIELDS} for it in items],
+                          "removed": removed}))
         return 0
     print(f"List {tilde(list_path)} (label {doc['label'] or '?'}, {doc['generated_at'] or 'undated'})")
-    for table, kind, title in CATEGORIES:
-        mine = [it for it in items if it["kind"] == kind and it["status"] != "installed"]
+    for cat in CATEGORY_NAMES:
+        mine = [it for it in items if it["category"] == cat and it["status"] != "installed"]
         if not mine:
             continue
-        print(f"\n{title}:")
+        print(f"\n{cat}:" + ("  (skipped on this machine)" if cat in cfg["skip_categories"] else ""))
         for it in mine:
             box = "[x]" if it["default"] else "[ ]"
             if not it["installable"]:
                 box = " - "
-            print(f"  {box} {it['name']}" + (f"  ({it['note']})" if it["note"] else "") + ("  [ignored]" if it["ignored"] else ""))
+            print(f"  {box} {it['name']}  ({TITLE_OF[it['kind']].rstrip('s').lower()}"
+                  + (f" · {it['note']}" if it["note"] else "") + ")" + ("  [ignored]" if it["ignored"] else ""))
     installed = sum(1 for it in items if it["status"] == "installed")
     print(f"\n{installed} already here.")
+    print_removed(removed)
     for e in errors:
         print("error: " + e)
     return 0
 
 
+def print_removed(removed):
+    if not removed:
+        return
+    print("\nRemoved on main (still here; Understudy never removes anything):")
+    for r in removed:
+        print(f"  {r['name']}  ({r['category']})\n    to remove it yourself: {r['command']}")
+
+
+def cmd_removed(args):
+    list_path, _, rest, _ = parse_common(args)
+    args = rest
+    cfg, here = read_config(), Here()
+    doc, items, _ = diff(list_path, cfg, here)
+    removed = removed_on_main(doc, items, cfg, here)
+    if "--json" in args:
+        print(json.dumps(removed))
+    elif not removed:
+        print("Nothing main used to list is still here.")
+    else:
+        print_removed(removed)
+    return 0
+
+
 def cmd_plan(args):
-    list_path, only, rest = parse_common(args)
+    list_path, only, rest, _ = parse_common(args)
     doc, items, errors = diff(list_path)
     groups = build_plan(select(items, only))
+    text = plan_text(groups, list_path, doc, errors, left_out(items, only))
     if "--json" in rest:
-        print(json.dumps({"groups": plan_json(groups), "text": plan_text(groups, list_path, doc, errors)}))
+        print(json.dumps({"groups": plan_json(groups), "text": text}))
     else:
-        sys.stdout.write(plan_text(groups, list_path, doc, errors))
+        sys.stdout.write(text)
     return 0
 
 
 def cmd_apply(args):
-    list_path, only, rest = parse_common(args)
+    list_path, only, rest, _ = parse_common(args)
     return apply(list_path, only, "--hold" in rest)
 
 
 def cmd_terminal(args):
-    list_path, only, _ = parse_common(args)
+    list_path, only, _, _ = parse_common(args)
     return open_terminal(list_path, only)
 
 
@@ -1669,6 +2156,296 @@ def cmd_ignore(args, add):
     return 0
 
 
+def cmd_category(args):
+    cfg = read_config()
+    if not args:
+        print("Categories: " + ", ".join(CATEGORY_NAMES))
+        for k, v in sorted(cfg["categories"].items()):
+            print(f"  {k} = {v}")
+        if not cfg["categories"]:
+            print("No overrides. Set one with: understudy category KEY CATEGORY")
+        return 0
+    if len(args) != 2:
+        raise Fail("usage: understudy category KEY CATEGORY | understudy category KEY --clear", 2)
+    key, value = args
+    if not KEY_RE.match(key):
+        raise Fail(f"not an item key: {key!r} (they look like package:steam or plugin:acme.weather)", 2)
+    if value == "--clear":
+        if cfg["categories"].pop(key, None) is None:
+            print(f"{key} had no override.")
+            return 0
+        write_config(cfg)
+        print(f"{key}: back to Understudy's own category.")
+        return 0
+    cat = canon_category(value)
+    if not cat:
+        raise Fail(f"not a category: {value!r}; one of {', '.join(CATEGORY_NAMES)}", 2)
+    cfg["categories"][key] = cat
+    write_config(cfg)
+    print(f"{key} is {cat} on this machine.")
+    return 0
+
+
+def cmd_skip(args, add):
+    cfg = read_config()
+    if not args and add:
+        print(", ".join(cfg["skip_categories"]) or "No category is skipped.")
+        return 0
+    if not args:
+        raise Fail("name a category, like Gaming", 2)
+    cats = []
+    for a in args:
+        c = canon_category(a)
+        if not c:
+            raise Fail(f"not a category: {a!r}; one of {', '.join(CATEGORY_NAMES)}", 2)
+        cats.append(c)
+    now = set(cfg["skip_categories"])
+    now = now | set(cats) if add else now - set(cats)
+    cfg["skip_categories"] = [c for c in CATEGORY_NAMES if c in now]
+    write_config(cfg)
+    print(("Skipped: " if add else "Offered again: ") + ", ".join(cats) + ".")
+    return 0
+
+
+def cmd_dismiss(args, add):
+    if not args:
+        raise Fail("name at least one item key, like package:steam", 2)
+    for k in args:
+        if not KEY_RE.match(k):
+            raise Fail(f"not an item key: {k!r}", 2)
+    cfg = read_config()
+    now = set(cfg["dismissed"])
+    cfg["dismissed"] = sorted(now | set(args) if add else now - set(args))
+    write_config(cfg)
+    return 0
+
+
+# ------------------------------------------------------------- Omarchy menu
+
+def menu_block():
+    entry = {"icon": "\U000f0322", "label": "Understudy", "description": "Make this Omarchy laptop match the main one",
+             "action": f"omarchy-shell shell toggle {SELF_ID}",
+             "when": f'test -f "$HOME/.config/omarchy/plugins/{SELF_ID}/manifest.json"'}
+    line = '  "understudy": ' + json.dumps(entry, ensure_ascii=False, separators=(",", ":")) + ","
+    return f"{MENU_BEGIN}\n{line}\n{MENU_END}\n"
+
+
+def strip_block(text):
+    pattern = re.compile(rf"^[ \t]*{re.escape(MENU_BEGIN.strip())}.*?^[ \t]*{re.escape(MENU_END.strip())}[^\n]*\n?",
+                         re.M | re.S)
+    return pattern.sub("", text)
+
+
+def jsonc_scan(text):
+    """Reads JSONC just far enough to find the top-level object: returns the
+    index of its `{` and its entries as (key, start, end, value), where
+    start..end covers the entry from the start of its line (when nothing else
+    is before it there) through its comma and the end of its line. Comments
+    and strings are skipped properly. Raises ValueError on what is not an
+    object."""
+    i, n = 0, len(text)
+
+    def skip_ws(i):
+        while i < n:
+            if text[i].isspace():
+                i += 1
+            elif text.startswith("//", i):
+                j = text.find("\n", i)
+                i = n if j < 0 else j + 1
+            elif text.startswith("/*", i):
+                j = text.find("*/", i + 2)
+                if j < 0:
+                    raise ValueError("an unclosed /* comment")
+                i = j + 2
+            else:
+                break
+        return i
+
+    def skip_string(i):
+        j = i + 1
+        while j < n:
+            if text[j] == "\\":
+                j += 2
+                continue
+            if text[j] == '"':
+                return j + 1
+            if text[j] == "\n":
+                break
+            j += 1
+        raise ValueError("an unclosed string")
+
+    def skip_value(i):
+        if text[i] == '"':
+            return skip_string(i)
+        if text[i] in "{[":
+            depth, j = 0, i
+            while j < n:
+                c = text[j]
+                if c == '"':
+                    j = skip_string(j)
+                    continue
+                if text.startswith("//", j) or text.startswith("/*", j):
+                    j = skip_ws(j)
+                    continue
+                if c in "{[":
+                    depth += 1
+                elif c in "}]":
+                    depth -= 1
+                    if depth == 0:
+                        return j + 1
+                j += 1
+            raise ValueError("an unclosed { or [")
+        m = re.compile(r"[^,}\s/]+").match(text, i)
+        if not m:
+            raise ValueError(f"no value at offset {i}")
+        return m.end()
+
+    i = skip_ws(0)
+    if i >= n or text[i] != "{":
+        raise ValueError("it does not start with {")
+    open_at = i
+    entries = []
+    i += 1
+    while True:
+        i = skip_ws(i)
+        if i >= n:
+            raise ValueError("the top-level { is never closed")
+        if text[i] == "}":
+            if skip_ws(i + 1) != n:
+                raise ValueError("there is more after the closing }")
+            return open_at, i, entries
+        if text[i] != '"':
+            raise ValueError(f"expected a key at offset {i}")
+        kstart = i
+        i = skip_string(i)
+        key = json.loads(text[kstart:i])
+        i = skip_ws(i)
+        if i >= n or text[i] != ":":
+            raise ValueError(f"expected : after {key!r}")
+        i = skip_ws(i + 1)
+        vstart = i
+        i = skip_value(i)
+        value = text[vstart:i]
+        j = i
+        while j < n and text[j] in " \t":
+            j += 1
+        if j < n and text[j] == ",":
+            i = j + 1
+        else:
+            k = skip_ws(i)
+            if k < n and text[k] == ",":
+                i = k + 1
+        # Take the rest of the line too when it is only spaces.
+        j = i
+        while j < n and text[j] in " \t":
+            j += 1
+        if j < n and text[j] == "\n":
+            i = j + 1
+        line_start = text.rfind("\n", 0, kstart) + 1
+        start = line_start if text[line_start:kstart].strip() == "" else kstart
+        entries.append((key, start, i, value))
+
+
+def jsonc_keys(text):
+    _, _, entries = jsonc_scan(text)
+    return [e[0] for e in entries]
+
+
+def strip_entries(text, keys, only_ours):
+    """Takes out top-level entries with these keys (outside the markers):
+    the hand-added lines from before `setup omarchy` existed."""
+    _, _, entries = jsonc_scan(text)
+    for key, start, end, value in reversed(entries):
+        if key in keys and (not only_ours or SELF_ID in value):
+            text = text[:start] + text[end:]
+    return text
+
+
+def omarchy_menu_parse(text):
+    """The menu the way Omarchy's shell reads it (MenuModel.js stripJsonc:
+    whole-line // comments and trailing commas go, then JSON.parse), with a
+    repeated key an error. None when it does not parse."""
+    stripped = re.sub(r"^\s*//[^\n]*(\n|$)", "", text, flags=re.M)
+    stripped = re.sub(r",(\s*[}\]])", r"\1", stripped)
+
+    def pairs(kv):
+        keys = [k for k, _ in kv]
+        if len(keys) != len(set(keys)):
+            raise ValueError("a key is there twice")
+        return dict(kv)
+    try:
+        data = json.loads(stripped, object_pairs_hook=pairs)
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def menu_write(path, new):
+    """Writes the menu file, keeping a copy of the old one next to it."""
+    mode = 0o644
+    if path.exists():
+        mode = path.stat().st_mode & 0o7777
+        stamp = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
+        backup, n = path.with_name(f"{path.name}.bak.{stamp}"), 1
+        while backup.exists():
+            backup, n = path.with_name(f"{path.name}.bak.{stamp}-{n}"), n + 1
+        shutil.copy2(path, backup)
+        print(f"Backed up the old one to {tilde(backup)}.")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write(path, new)
+    os.chmod(path, mode)
+
+
+def cmd_setup(args):
+    if args != ["omarchy"]:
+        raise Fail("usage: understudy setup omarchy", 2)
+    path = MENU_FILE
+    old = path.read_text("utf-8") if path.exists() else None
+    text = old if old is not None else "{\n}\n"
+    try:
+        jsonc_scan(text)
+        text = strip_block(text)
+        # A hand-added "understudy" line would be a second entry under the
+        # same key; v0.1's README suggested "install.understudy".
+        text = strip_entries(text, {"understudy"}, only_ours=False)
+        text = strip_entries(text, {"install.understudy"}, only_ours=True)
+        open_at, _, _ = jsonc_scan(text)
+    except ValueError as e:
+        raise Fail(f"{tilde(path)} is not JSONC Understudy can read ({e}); not changed.")
+    new = text[:open_at + 1] + "\n" + menu_block() + text[open_at + 1:].lstrip("\n")
+    if jsonc_keys(new).count("understudy") != 1 or (
+            omarchy_menu_parse(text) is not None and "understudy" not in (omarchy_menu_parse(new) or {})):
+        raise Fail(f"internal error: the menu entry did not read back; {tilde(path)} not changed")
+    if new == old:
+        print(f"Understudy is already in the Omarchy menu ({tilde(path)}).")
+        return 0
+    menu_write(path, new)
+    print(f"Added Understudy to the Omarchy menu ({tilde(path)}).")
+    return 0
+
+
+def cmd_remove(args):
+    if args != ["omarchy"]:
+        raise Fail("usage: understudy remove omarchy", 2)
+    path = MENU_FILE
+    if not path.exists():
+        print(f"No {tilde(path)}; nothing to remove.")
+        return 0
+    old = path.read_text("utf-8")
+    try:
+        jsonc_scan(old)
+        new = strip_entries(strip_block(old), {"understudy", "install.understudy"}, only_ours=True)
+        jsonc_scan(new)
+    except ValueError as e:
+        raise Fail(f"{tilde(path)} is not JSONC Understudy can read ({e}); not changed.")
+    if new == old:
+        print("Understudy is not in the Omarchy menu.")
+        return 0
+    menu_write(path, new)
+    print(f"Took Understudy out of the Omarchy menu ({tilde(path)}).")
+    return 0
+
+
 def main(argv):
     cmd, args = (argv[0], argv[1:]) if argv else ("toggle", [])
     try:
@@ -1679,6 +2456,9 @@ def main(argv):
             "export": cmd_export, "import": cmd_import, "diff": cmd_diff, "plan": cmd_plan,
             "apply": cmd_apply, "terminal": cmd_terminal,
             "ignore": lambda a: cmd_ignore(a, True), "unignore": lambda a: cmd_ignore(a, False),
+            "category": cmd_category, "skip": lambda a: cmd_skip(a, True), "unskip": lambda a: cmd_skip(a, False),
+            "removed": cmd_removed, "dismiss": lambda a: cmd_dismiss(a, True),
+            "undismiss": lambda a: cmd_dismiss(a, False), "setup": cmd_setup, "remove": cmd_remove,
         }
         if cmd in ("-h", "--help", "help"):
             print(__doc__.split("\n\n")[1])

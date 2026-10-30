@@ -5,14 +5,15 @@
 #   tests/secondary_test.sh            UPDATE_SNAPSHOTS=1 to rewrite the dry-run snapshot
 #
 # A fake second laptop under a throwaway HOME (see tests/lib.sh) reads
-# tests/fixtures/list.toml: what shows as missing, installed, manual or
+# tests/fixtures/list-v0.1.toml (and list-v0.2.toml): what shows as missing, installed, manual or
 # unavailable, the exact commands (checked against tests/snapshots/plan.txt),
 # the install order and stop-on-failure, putting the theme back, the ignore
 # file, the folder-missing fallback, and lists written to cause trouble.
 
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
-FIX="$REPO/tests/fixtures/list.toml"
+FIX="$REPO/tests/fixtures/list-v0.1.toml"
+FIX2="$REPO/tests/fixtures/list-v0.2.toml"
 SNAP="$REPO/tests/snapshots/plan.txt"
 
 # ------------------------------------------------------------ the machine
@@ -328,5 +329,170 @@ check "something that is not TOML is refused" bash -c '[[ $1 != 0 ]] && grep -q 
 printf 'format = 1\npackages = "rclone"\n' >"$ROOT/shape.toml"
 check "a category that is not a list of entries is an error, not a crash" \
   test "$(us diff --json --list "$ROOT/shape.toml" | jq '.errors | length')" = 1
+
+# ------------------------------------------------------------ categories
+
+note "categories: a v0.1 list has none, so they are worked out here"
+cp "$ROOT/installed.fresh" "$S/installed"
+printf 'extra mixer 1.0\nextra mailer 2.0\n' >>"$S/sl"
+printf 'Name            : mixer\nDescription     : Mixing desk\nGroups          : pro-audio\n' >"$S/si/mixer"
+printf 'Name            : mailer\nDescription     : A fast e-mail client\nGroups          : None\n' >"$S/si/mailer"
+v1=$(us diff --json --list "$FIX")
+cat_of() { jq -r --arg k "$2" '.items[] | select(.key == $k) | "\(.category) \(.category_from)"' <<<"$1"; }
+check "an old list still reads, every entry" test "$(jq '.items | length' <<<"$v1") $(jq '.errors | length' <<<"$v1")" = "23 0"
+check "every item gets a category" test "$(jq '[.items[] | select(.category == null or .category == "")] | length' <<<"$v1")" = 0
+check "the steam installer is Gaming, worked out here" test "$(cat_of "$v1" installer:omarchy-install-gaming-steam)" = "Gaming here"
+check "a browser installer is Internet/Communication" test "$(cat_of "$v1" installer:omarchy-install-browser=brave)" = "Internet/Communication here"
+check "btop is CLI/TUI" test "$(cat_of "$v1" package:btop)" = "CLI/TUI here"
+check "a hardware package is System/Hardware" test "$(cat_of "$v1" package:nvidia-dkms)" = "System/Hardware here"
+check "themes are Themes/Look" test "$(cat_of "$v1" theme:sunset)" = "Themes/Look here"
+check "a whole-bar plugin is Themes/Look" test "$(cat_of "$v1" plugin:acme.tallbar)" = "Themes/Look here"
+check "a TUI launcher is CLI/TUI" test "$(cat_of "$v1" tui:Top)" = "CLI/TUI here"
+check "an AUR package with nothing to go on is Other" test "$(cat_of "$v1" aur:my-aur-tool)" = "Other here"
+
+note "categories: a v0.2 list carries main's"
+v2=$(us diff --json --list "$FIX2")
+check "main's category is kept, over the built-in one (rclone: Dev)" test "$(cat_of "$v2" package:rclone)" = "Dev list"
+check "a category Understudy does not know is worked out here" test "$(cat_of "$v2" package:restic)" = "System/Hardware here"
+check "pacman groups decide for a package not installed here (pro-audio: Media)" test "$(cat_of "$v2" package:mixer)" = "Media here"
+check "description words decide after that (e-mail: Internet/Communication)" test "$(cat_of "$v2" package:mailer)" = "Internet/Communication here"
+check "an unknown category is not an error" test "$(jq '.errors | length' <<<"$v2")" = 0
+us category package:rclone Media >/dev/null
+check "this machine's override wins over main's" test "$(cat_of "$(us diff --json --list "$FIX2")" package:rclone)" = "Media override"
+us category package:rclone --clear >/dev/null
+check "and clearing it gives main's back" test "$(cat_of "$(us diff --json --list "$FIX2")" package:rclone)" = "Dev list"
+
+# ------------------------------------------------------------ skip by type
+
+note "skip by type"
+check "skip takes a category in any case" us skip gaming
+check "kept in config.toml" grep -qx 'skip_categories = \["Gaming"\]' "$H/.config/understudy/config.toml"
+check "skip with no category lists what is skipped" test "$(us skip)" = Gaming
+check "an unknown category is refused" bash -c '! "$@" 2>/dev/null' _ us skip snacks
+sk=$(us diff --json --list "$FIX")
+check "the diff names the skipped categories" test "$(jq -c .skip_categories <<<"$sk")" = '["Gaming"]'
+check "a skipped item is still shown, marked skipped and unticked" \
+  test "$(jq -r '.items[] | select(.key == "installer:omarchy-install-gaming-steam") | "\(.skipped) \(.installable) \(.default)"' <<<"$sk")" = "true true false"
+check "other categories are untouched" test "$(jq -r '.items[] | select(.key == "package:rclone") | "\(.skipped) \(.default)"' <<<"$sk")" = "false true"
+reset_log
+sp=$(us plan --list "$FIX")
+check "the plan leaves the skipped item out" bash -c '! grep -q omarchy-install-gaming-steam <<<"$1"' _ "$sp"
+check "and says what it left out and why" bash -c 'grep -q "Left out: 1 item in categories this machine skips (Gaming). Tick them by hand to add them." <<<"$1"' _ "$sp"
+out=$(printf 'n\n' | us apply --list "$FIX" 2>&1)
+check "apply's plan leaves it out too" bash -c '! grep -q "omarchy-install-gaming-steam" <<<"$1" && grep -q "Left out: 1 item" <<<"$1"' _ "$out"
+check "ticked by hand, it is in the plan" \
+  test "$(us plan --json --list "$FIX" --only installer:omarchy-install-gaming-steam | jq -r '.groups[0].commands[0]')" = omarchy-install-gaming-steam
+check "a hand-picked plan does not claim anything was left out" bash -c '! "$@" | grep -q "Left out"' _ us plan --list "$FIX" --only package:rclone
+check "nothing ran" bash -c '! grep -E "^(omarchy-pkg|omarchy-install|setsid)" "$1"' _ "$LOG"
+us skip Media >/dev/null
+check "a second skip keeps the first, in category order" grep -qx 'skip_categories = \["Gaming", "Media"\]' "$H/.config/understudy/config.toml"
+check "unskip offers a category again" us unskip GAMING
+check "and only that one" grep -qx 'skip_categories = \["Media"\]' "$H/.config/understudy/config.toml"
+us unskip media >/dev/null
+check "the steam installer is ticked again" test "$(us diff --json --list "$FIX" | jq -r '.items[] | select(.key == "installer:omarchy-install-gaming-steam") | .default')" = true
+
+# -------------------------------------------------------- removed on main
+
+note "removed on main: the history"
+HIST="$H/.local/state/understudy/history.json"
+rm -f "$HIST" "$H/.local/state/understudy/imported.toml"
+list_at() { # generated_at, then lines of TOML entries
+  local at="$1"; shift
+  printf 'format = 1\ngenerated_at = "%s"\nlabel = "tuf"\n\n' "$at"
+  printf '%s\n' "$@"
+}
+OLD_ENTRIES=('[[packages]]' 'name = "rclone"' 'repo = "extra"' 'category = "Internet/Communication"'
+  '[[packages]]' 'name = "restic"' 'repo = "extra"'
+  '[[packages]]' 'name = "git"' 'repo = "extra"'
+  '[[packages]]' 'name = "never-here"' 'repo = "extra"'
+  '[[packages]]' 'name = "dep-only"' 'repo = "extra"'
+  '[[aur]]' 'name = "my-aur-tool"'
+  '[[installers]]' 'command = "omarchy-install-gaming-steam"' 'packages = ["steam"]'
+  '[[themes]]' 'name = "sunset"' 'source = "https://github.com/someone/omarchy-sunset-theme.git"'
+  '[[themes]]' 'name = "tokyo-night"' 'source = "https://github.com/basecamp/omarchy-tokyo-night.git"'
+  '[[plugins]]' 'id = "acme.weather"' 'source = "https://github.com/acme/omarchy-weather.git"'
+  '[[webapps]]' 'name = "Notes"' 'url = "https://notes.example.com/app"'
+  '[[tuis]]' 'name = "Top"' 'command = "btop"' 'style = "float"')
+NEW_ENTRIES=('[[packages]]' 'name = "btop"' 'repo = "extra"')
+list_at "2026-10-20T08:00:00Z" "${OLD_ENTRIES[@]}" >"$H/Sync/understudy/understudy.toml"
+# This machine has all of it (dep-only only as a dependency), except never-here.
+printf '%s\n' base git yay hyprland omarchy btop rclone restic my-aur-tool steam dep-only >"$S/installed"
+printf '%s\n' git btop rclone restic my-aur-tool steam >"$S/explicit"
+mkdir -p "$H/.config/omarchy/themes/sunset" "$H/.config/omarchy/plugins/acme.weather" "$H/.local/share/applications"
+echo '{"id":"acme.weather"}' >"$H/.config/omarchy/plugins/acme.weather/manifest.json"
+printf '[Desktop Entry]\nExec=omarchy-launch-webapp https://notes.example.com/app\n' >"$H/.local/share/applications/Notes.desktop"
+printf '[Desktop Entry]\nExec=xdg-terminal-exec --app-id=TUI.float -e btop\n' >"$H/.local/share/applications/Top.desktop"
+d1=$(us diff --json)
+check "the first list shows nothing removed" test "$(jq '.removed | length' <<<"$d1")" = 0
+check "reading it from the shared folder recorded it" test "$(jq -r '[.lists[].generated_at] | join(" ")' "$HIST")" = "2026-10-20T08:00:00Z"
+us diff --json >/dev/null
+check "reading the same list again records it once" test "$(jq '.lists | length' "$HIST")" = 1
+us diff --json --list "$FIX" >/dev/null
+check "a list named with --list is not remembered" test "$(jq '.lists | length' "$HIST")" = 1
+
+note "removed on main: the reminder"
+list_at "2026-10-30T08:00:00Z" "${NEW_ENTRIES[@]}" >"$H/Sync/understudy/understudy.toml"
+reset_log
+d2=$(us diff --json)
+rm_cmd() { jq -r --arg k "$1" '.removed[] | select(.key == $k) | .command' <<<"$d2"; }
+check "the newer list is recorded too" test "$(jq '.lists | length' "$HIST")" = 2
+check "what main dropped and is here is listed" \
+  test "$(jq -r '[.removed[].key] | join(" ")' <<<"$d2")" = "aur:my-aur-tool installer:omarchy-install-gaming-steam package:rclone package:restic plugin:acme.weather theme:sunset tui:Top webapp:Notes"
+check "a package main dropped that is an Omarchy default here is not (git)" bash -c '! jq -r ".removed[].key" <<<"$1" | grep -qx package:git' _ "$d2"
+check "nor one that is not here at all" bash -c '! jq -r ".removed[].key" <<<"$1" | grep -qx package:never-here' _ "$d2"
+check "nor one that is here only as a dependency" bash -c '! jq -r ".removed[].key" <<<"$1" | grep -qx package:dep-only' _ "$d2"
+check "nor a built-in theme" bash -c '! jq -r ".removed[].key" <<<"$1" | grep -qx theme:tokyo-night' _ "$d2"
+check "nor anything still on main's list (btop)" bash -c '! jq -r ".removed[].key" <<<"$1" | grep -qx package:btop' _ "$d2"
+check "a package comes with omarchy pkg drop" test "$(rm_cmd package:rclone)" = "omarchy pkg drop rclone"
+check "an installer with its package" test "$(rm_cmd installer:omarchy-install-gaming-steam)" = "omarchy pkg drop steam"
+check "a theme with omarchy theme remove" test "$(rm_cmd theme:sunset)" = "omarchy theme remove sunset"
+check "a plugin with omarchy plugin remove" test "$(rm_cmd plugin:acme.weather)" = "omarchy plugin remove acme.weather"
+check "a web app and a TUI with omarchy webapp/tui remove" test "$(rm_cmd webapp:Notes) | $(rm_cmd tui:Top)" = "omarchy webapp remove Notes | omarchy tui remove Top"
+check "each keeps the category main gave it" test "$(jq -r '.removed[] | select(.key == "package:rclone") | .category' <<<"$d2")" = Internet/Communication
+check "Understudy removed nothing" bash -c '! grep -E "(remove|drop|uninstall)" "$1" && grep -qx rclone "$2" && test -d "$3"' _ "$LOG" "$S/installed" "$H/.config/omarchy/themes/sunset"
+txt=$(us diff)
+check "the text diff shows the reminder and the command" bash -c 'grep -q "^Removed on main" <<<"$1" && grep -q "to remove it yourself: omarchy theme remove sunset" <<<"$1"' _ "$txt"
+check "understudy removed --json lists the same" test "$(us removed --json | jq -r '[.[].key] | join(" ")')" = "$(jq -r '[.removed[].key] | join(" ")' <<<"$d2")"
+
+note "removed on main: dismissing"
+check "dismiss takes keys" us dismiss package:restic theme:sunset
+check "kept in config.toml" grep -qx 'dismissed = \["package:restic", "theme:sunset"\]' "$H/.config/understudy/config.toml"
+check "dismissed items are no longer listed" bash -c '! "$@" | grep -qE "^package:restic|^theme:sunset"' _ bash -c 'us removed --json | jq -r ".[].key"'
+check "a bad key is refused" bash -c '! "$@" 2>/dev/null' _ us dismiss 'theme:$(id)'
+check "undismiss brings one back" us undismiss theme:sunset
+check "and it is listed again" bash -c 'us removed --json | jq -r ".[].key" | grep -qx theme:sunset'
+check "skip and category settings survive it all" grep -qx '\[categories\]' "$H/.config/understudy/config.toml"
+
+note "removed on main: what counts as older"
+cp "$H/Sync/understudy/understudy.toml" "$ROOT/newest.toml"
+list_at "2026-10-01T08:00:00Z" "${NEW_ENTRIES[@]}" '[[packages]]' 'name = "zzz-older-only"' 'repo = "extra"' >"$ROOT/older.toml"
+printf 'zzz-older-only\n' >>"$S/installed"; printf 'zzz-older-only\n' >>"$S/explicit"
+check "import remembers a list" bash -c 'us import "$1" >/dev/null && jq -r ".lists[].generated_at" "$2" | grep -qx 2026-10-01T08:00:00Z' _ "$ROOT/older.toml" "$HIST"
+check "an item only on an older list shows once a newer list is read" \
+  bash -c 'us diff --json | jq -r ".removed[].key" | grep -qx package:zzz-older-only'
+check "but not when that older list is the one being read" \
+  bash -c '! us removed --json --list "$1" | jq -r ".[].key" | grep -q .' _ "$ROOT/older.toml"
+
+note "removed on main: a history file that was tampered with"
+cp "$HIST" "$ROOT/hist.good"
+cat >"$HIST" <<'EOT'
+{"version": 1, "lists": [{"generated_at": "2026-01-01T00:00:00Z", "keys": ["theme:../../x", "package:$(id)", "plugin:omarchy.clock", "package:restic"]}, "junk", {"keys": 5}],
+ "items": {"package:restic": {"kind": "package", "name": "restic"}, "plugin:omarchy.clock": {"kind": "plugin", "name": "omarchy.clock"}, "theme:../../x": {"kind": "theme", "name": "../../x"}, "package:$(id)": {"kind": "package", "name": "$(id)"}}}
+EOT
+mkdir -p "$H/.config/omarchy/plugins/omarchy.clock"
+echo '{"id":"omarchy.clock"}' >"$H/.config/omarchy/plugins/omarchy.clock/manifest.json"
+us undismiss package:restic >/dev/null
+tam=$(us diff --json 2>&1)
+check "it still reads; only the sound entry is offered" test "$(jq -c '[.removed[].key]' <<<"$tam")" = '["package:restic"]'
+echo 'not json' >"$HIST"
+check "a history that is not JSON is started again (the shared list and the imported copy)" bash -c 'us diff --json >/dev/null && jq -e ".lists | length == 2" "$1" >/dev/null' _ "$HIST"
+python3 - "$HIST" <<'PY'
+import json, sys
+json.dump({"version": 1, "lists": [{"generated_at": f"2025-01-{d:02d}T00:00:00Z", "keys": ["package:rclone"]} for d in range(1, 31)]
+           + [{"generated_at": f"2025-02-{d:02d}T00:00:00Z", "keys": ["package:rclone"]} for d in range(1, 29)],
+          "items": {"package:rclone": {"kind": "package", "name": "rclone"}}}, open(sys.argv[1], "w"))
+PY
+us import "$ROOT/older.toml" >/dev/null
+check "the history keeps the last 50 lists" test "$(jq '.lists | length' "$HIST") $(jq -r '.lists[-1].generated_at' "$HIST")" = "50 2026-10-01T08:00:00Z"
 
 finish
