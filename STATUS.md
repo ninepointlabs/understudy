@@ -1,9 +1,8 @@
 # Understudy v0.1 — status
 
-- **Branch:** `feat/v0.1` (main untouched; no remote, nothing pushed)
-- **Head:** `94493efbfc11f27789ee17bb0cee8d1c2f37256f` ("Understudy v0.1: make a second Omarchy laptop match the main one"),
+- **Branch:** `feat/v0.1`, pushed to https://github.com/ninepointlabs/understudy (public) and merged to `main` through PR #1
+- **Code commit:** `7cdce3e` ("Understudy v0.1: make a second Omarchy laptop match the main one"), followed by this STATUS.md,
   committed as Nine Point Labs <179739321+ninepointlabs@users.noreply.github.com>
-- This STATUS.md is deliberately **not committed**, so the sha above stays the head. Commit it or delete it as you prefer.
 
 ## What was built
 
@@ -86,7 +85,7 @@ command is a stub; the helper's PATH holds only stubs and a few coreutils (Omarc
 
 ## Hand-test on the Surface
 
-1. On TUF: `omarchy plugin add <repo-url> --enable` (once the repo exists), open the overlay, press M (Main), then S to scan.
+1. On TUF: `omarchy plugin add https://github.com/ninepointlabs/understudy.git --enable`, open the overlay, press M (Main), then S to scan.
    Check the counts match the summary above.
 2. Set up `~/Sync/understudy` in Syncthing and share it with the Surface (README, "Set up the shared folder"). Press Enter to export.
    Open the file and read it: names and URLs only.
@@ -118,8 +117,7 @@ command is a stub; the helper's PATH holds only stubs and a few coreutils (Omarc
 
 ## Before a marketplace submission
 
-- The repo does not exist yet (ninepointlabs/understudy is to be created by your assistant); README install URL assumes it, and it
-  must be public for the marketplace.
+- The repo is public at https://github.com/ninepointlabs/understudy, matching the README install URL.
 - No `preview.png` (couldn't render the overlay without installing it). Optional, but worth adding after the Surface test.
 - Check the id/name against the live registry (publish skill step 2) — I did not fetch the registry.
 - Expect `review-required`: README and code mention `sudo`, `omarchy pkg add`/`omarchy-pkg-add`, `yay`, `pacman` (→ `privilege`,
