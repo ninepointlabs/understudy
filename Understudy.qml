@@ -40,6 +40,13 @@ Item {
   // Items unticked during this visit stay in view until the next open.
   property var keepShown: ({})
   property bool showAll: false
+  // "category" (sections by what items are for, the default) or "kind"
+  // (by how they install, as in v0.1). G switches.
+  property string groupBy: "category"
+  // Category name (or "removed") -> folded.
+  property var collapsed: ({})
+  property string categoryFilter: ""
+  property bool panelOpen: false
   property var rows: []
   property int selectedIndex: -1
   property var current: null
@@ -87,6 +94,7 @@ Item {
     root.planOpen = false
     root.confirmOpen = false
     root.promptKind = ""
+    root.panelOpen = false
     root.keepShown = ({})
     root.autoExported = false
     root.say("", false)
@@ -171,6 +179,7 @@ Item {
     if (!d) return
     var first = !root.diff
     root.diff = d
+    if (first) root.collapsed = Model.initialCollapsed(d.skipCategories)
     if (first || Object.keys(root.ticks).length === 0) root.ticks = Model.initialTicks(d.items)
     else {
       // Keep this visit's choices; new items start at their default.
@@ -184,9 +193,21 @@ Item {
 
   function rebuild() {
     var keep = root.current ? root.current.key : ""
-    if (root.role === "main") root.rows = Model.buildMainRows(root.scan)
-    else if (root.role === "secondary" && root.diff) root.rows = Model.buildSecondaryRows(root.diff.items, root.ticks, root.showAll, root.keepShown)
-    else root.rows = []
+    var byCategory = root.groupBy === "category"
+    if (root.panelOpen) {
+      var entries = root.role === "main" ? (root.scan ? root.scan.rows : []) : (root.diff ? root.diff.items : [])
+      root.rows = Model.buildCategoryPanelRows(entries, root.diff ? root.diff.skipCategories : [], root.categoryFilter,
+                                               root.role === "secondary")
+    } else if (root.role === "main") {
+      root.rows = byCategory ? Model.buildMainCategoryRows(root.scan, root.collapsed, root.categoryFilter) : Model.buildMainRows(root.scan)
+    } else if (root.role === "secondary" && root.diff) {
+      root.rows = byCategory
+        ? Model.buildCategoryRows(root.diff.items, root.ticks, { showAll: root.showAll, keep: root.keepShown, collapsed: root.collapsed,
+                                  filter: root.categoryFilter, skip: root.diff.skipCategories, removed: root.diff.removed })
+        : Model.buildSecondaryRows(root.diff.items, root.ticks, root.showAll, root.keepShown)
+    } else {
+      root.rows = []
+    }
 
     displayModel.clear()
     for (var i = 0; i < root.rows.length; i++) {
@@ -199,7 +220,8 @@ Item {
         icon: row.icon || "",
         checkable: row.checkable === true,
         checked: row.checked === true,
-        installed: row.status === "installed"
+        installed: row.status === "installed",
+        collapsed: row.collapsed === true
       })
     }
     var idx = Model.indexOfKey(root.rows, keep)
@@ -214,7 +236,7 @@ Item {
 
   function syncCurrent() {
     var row = root.selectedIndex >= 0 && root.selectedIndex < root.rows.length ? root.rows[root.selectedIndex] : null
-    root.current = row && row.rowType === "item" ? row : null
+    root.current = Model.selectable(row) ? row : null
   }
 
   function select(delta) {
@@ -234,7 +256,7 @@ Item {
   }
 
   function selectIndex(index) {
-    if (index < 0 || index >= root.rows.length || root.rows[index].rowType !== "item") return
+    if (index < 0 || index >= root.rows.length || !Model.selectable(root.rows[index])) return
     root.selectedIndex = index
     root.syncCurrent()
   }
@@ -287,7 +309,11 @@ Item {
   }
 
   function toggleCurrent() {
-    if (root.role !== "secondary" || !root.current) return
+    if (!root.current) return
+    if (root.current.rowType === "section") { root.fold(!root.current.collapsed); return }
+    if (root.current.rowType === "cat") { root.toggleSkipCurrent(); return }
+    if (root.current.rowType === "removed") { root.say("Y copies the command to remove it yourself; X stops reminding you.", false); return }
+    if (root.role !== "secondary") return
     var item = root.itemFor(root.current.key)
     if (!item || !item.installable) {
       root.say(item && item.status === "installed" ? "Already installed here." : "This one can't be installed from here: " + (item ? item.note : ""), false)
@@ -306,6 +332,79 @@ Item {
       item.ignored = false
     }
     root.rebuild()
+  }
+
+  // Folds (or unfolds) the section the cursor is in, leaving the cursor on
+  // its header.
+  function fold(shut) {
+    if (root.groupBy !== "category" || root.panelOpen || root.planOpen) return
+    var at = Model.sectionIndexOf(root.rows, root.selectedIndex)
+    if (at < 0) return
+    var name = Model.sectionName(root.rows[at])
+    if ((root.collapsed[name] === true) === shut) { root.selectIndex(at); return }
+    root.collapsed = Model.toggleCollapsed(root.collapsed, name)
+    root.current = root.rows[at]
+    root.rebuild()
+  }
+
+  function togglePanel() {
+    root.panelOpen = !root.panelOpen
+    root.current = null
+    root.selectedIndex = 0
+    root.rebuild()
+  }
+
+  // Enter in the category panel: show only that category ("All" shows all).
+  function pickFilter() {
+    if (!root.current || root.current.rowType !== "cat") return
+    root.categoryFilter = root.current.key.replace(/^panel:/, "")
+    root.panelOpen = false
+    root.current = null
+    root.selectedIndex = 0
+    root.say(root.categoryFilter ? "Showing only " + root.categoryFilter + ". C, then Enter on All, shows everything." : "", false)
+    root.rebuild()
+  }
+
+  function toggleSkipCurrent() {
+    if (root.role !== "secondary" || !root.diff || !root.current || !root.current.checkable) return
+    var name = root.current.name
+    var r = Model.toggleSkip(root.diff.skipCategories, name)
+    if (!r.action) return
+    root.run([r.action, name], "", function() {
+      // Fold a category as it is skipped, so it leaves the list the way it
+      // would on the next open; its items are unticked by the helper.
+      if (r.action === "skip" && root.collapsed[name] !== true) root.collapsed = Model.toggleCollapsed(root.collapsed, name)
+      // Untick what is now skipped; what is offered again goes back to its
+      // default when the list is read again.
+      var t = {}
+      for (var k in root.ticks) t[k] = root.ticks[k]
+      for (var i = 0; i < root.diff.items.length; i++) {
+        var it = root.diff.items[i]
+        if (it.category !== name) continue
+        if (r.action === "skip") t[it.key] = false
+        else delete t[it.key]
+      }
+      root.ticks = t
+      root.say(r.action === "skip" ? name + " is skipped on this laptop: folded and never ticked unless you tick an item by hand."
+                                   : name + " is offered again.", false)
+      root.loadDiff()
+    })
+  }
+
+  function copyRemoveCommand() {
+    if (!root.current || root.current.rowType !== "removed") return
+    copyProcess.command = ["wl-copy", "--", root.current.command]
+    copyProcess.running = true
+    root.say("Copied: " + root.current.command, false)
+  }
+
+  function dismissRemoved() {
+    if (!root.current || root.current.rowType !== "removed") return
+    var key = root.current.key
+    root.run(["dismiss", key], "", function() {
+      root.say("No longer reminding you about " + key + ". `understudy undismiss " + key + "` brings it back.", false)
+      root.loadDiff()
+    })
   }
 
   function showPlan() {
@@ -417,6 +516,14 @@ Item {
   }
 
   Process {
+    id: copyProcess
+    stderr: StdioCollector { id: copyErr; waitForEnd: true }
+    onExited: function(exitCode) {
+      if (exitCode !== 0) root.say("Could not copy (is wl-copy installed?) " + Model.lastLine(copyErr.text), true)
+    }
+  }
+
+  Process {
     id: ignoreProcess
     stderr: StdioCollector { id: ignoreErr; waitForEnd: true }
     onExited: function(exitCode) {
@@ -440,6 +547,19 @@ Item {
       else if (Util.editsFilter(event, root.promptText)) root.promptText = Util.editedFilter(event, root.promptText)
       else if (!ctrl && event.text && event.text.length === 1 && event.text.charCodeAt(0) >= 32 && event.text.charCodeAt(0) !== 127)
         root.promptText += event.text
+      event.accepted = true
+      return
+    }
+
+    if (root.panelOpen) {
+      if (key === Qt.Key_Escape || key === Qt.Key_C) root.togglePanel()
+      else if (key === Qt.Key_Down) root.select(1)
+      else if (key === Qt.Key_Up) root.select(-1)
+      else if (key === Qt.Key_Home) root.selectEdge(false)
+      else if (key === Qt.Key_End) root.selectEdge(true)
+      else if (key === Qt.Key_Space) root.toggleSkipCurrent()
+      else if (key === Qt.Key_Return || key === Qt.Key_Enter) root.pickFilter()
+      else return
       event.accepted = true
       return
     }
@@ -470,6 +590,22 @@ Item {
       root.switchRole()
     } else if (key === Qt.Key_F) {
       root.openPrompt("folder")
+    } else if (root.role !== "" && key === Qt.Key_C) {
+      root.togglePanel()
+    } else if (root.role !== "" && key === Qt.Key_G) {
+      root.groupBy = root.groupBy === "category" ? "kind" : "category"
+      root.say(root.groupBy === "category" ? "Grouped by category." : "Grouped by type, as Understudy installs them.", false)
+      root.rebuild()
+    } else if (root.role !== "" && key === Qt.Key_Left) {
+      root.fold(true)
+    } else if (root.role !== "" && key === Qt.Key_Right) {
+      root.fold(false)
+    } else if (root.role !== "" && key === Qt.Key_Space && root.current && root.current.rowType === "section") {
+      root.toggleCurrent()
+    } else if (root.role === "secondary" && key === Qt.Key_Y) {
+      root.copyRemoveCommand()
+    } else if (root.role === "secondary" && key === Qt.Key_X) {
+      root.dismissRemoved()
     } else if (root.role === "" && key === Qt.Key_M) {
       root.setRole("main")
     } else if (root.role === "" && key === Qt.Key_S) {
@@ -502,20 +638,24 @@ Item {
   function hintsText() {
     if (root.promptKind !== "") return "⏎ ok   esc cancel"
     if (root.planOpen) return "↑↓ scroll   esc back"
-    if (root.role === "main") return "S scan   ⏎/E export   P export to…   A auto-export   F folder   tab role   esc close"
-    if (root.role === "secondary") return "space tick   D show commands   ⏎ install   I import…   H " + (root.showAll ? "hide" : "show") + " all   F folder   tab role"
+    if (root.panelOpen) return root.role === "secondary" ? "space skip on this laptop   ⏎ show only this   esc back" : "⏎ show only this   esc back"
+    if (root.role === "main") return "S scan   ⏎/E export   P export to…   A auto-export   C categories   G group   ←→ fold   F folder   tab role"
+    if (root.role === "secondary" && root.current && root.current.rowType === "removed") return "Y copy the command   X stop reminding   ↑↓ move   esc close"
+    if (root.role === "secondary") return "space tick   ←→ fold   C categories   G group   D commands   ⏎ install   I import   H " + (root.showAll ? "hide" : "all") + "   tab role"
     return "M main   S secondary   esc close"
   }
 
   function emptyText() {
     if (root.role === "") return "Is this the main laptop, or the second one?"
     if (root.busyText) return root.busyText
+    if (root.role === "main" && root.categoryFilter && root.scan) return "Nothing in " + root.categoryFilter + ". Press C, then Enter on All categories."
     if (root.role === "main") return root.scan ? "Nothing was added since the first Omarchy install." : "Press S to scan."
     if (!root.diff) {
       if (root.status && !root.status.folderExists)
         return "The shared folder " + root.status.folder + " does not exist yet. Set it up in Syncthing (see the README), press F to pick another folder, or I to import a list from any path."
       return "No list yet. Export it on the main laptop, or press I to import one from any path."
     }
+    if (root.categoryFilter) return "Nothing to show in " + root.categoryFilter + ". Press C, then Enter on All categories."
     return root.showAll ? "The list is empty." : "Everything on the list is here. H shows it all."
   }
 
@@ -649,6 +789,7 @@ Item {
             text: root.busyText ? root.busyText
               : root.role === "main" ? Model.scanSummary(root.scan)
               : root.role === "secondary" && root.diff ? Model.diffSummary(root.diff.items, root.ticks)
+                + (root.categoryFilter ? " · only " + root.categoryFilter : "")
               : ""
             color: root.dim
             font.family: root.fontFamily
@@ -703,8 +844,10 @@ Item {
               required property bool checkable
               required property bool checked
               required property bool installed
+              required property bool collapsed
 
               readonly property bool isHeader: rowType === "header"
+              readonly property bool isSection: rowType === "section"
               readonly property bool hasCursor: !isHeader && index === root.selectedIndex
               readonly property color ink: hasCursor ? root.selectedText : root.foreground
 
@@ -749,9 +892,12 @@ Item {
                     textFormat: Text.PlainText
                     width: Style.space(18)
                     anchors.verticalCenter: parent.verticalCenter
-                    visible: root.role === "secondary"
-                    text: row.installed ? "󰄬" : !row.checkable ? "󰅖" : row.checked ? "󰄲" : "󰄱"
-                    color: row.checkable ? row.ink : root.dim
+                    visible: root.role === "secondary" || row.isSection
+                    text: row.isSection ? (row.collapsed ? "󰅂" : "󰅀")
+                      : row.rowType === "removed" ? "󰆴"
+                      : row.rowType === "cat" && !row.checkable ? ""
+                      : row.installed ? "󰄬" : !row.checkable ? "󰅖" : row.checked ? "󰄲" : "󰄱"
+                    color: row.checkable || row.isSection ? row.ink : root.dim
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.icon
                     horizontalAlignment: Text.AlignHCenter
@@ -780,10 +926,10 @@ Item {
                       width: parent.width
                       text: row.name
                       color: row.ink
-                      opacity: root.role === "secondary" && !row.checkable ? 0.6 : 1
+                      opacity: root.role === "secondary" && row.rowType === "item" && !row.checkable ? 0.6 : 1
                       font.family: root.fontFamily
                       font.pixelSize: Style.font.body
-                      font.bold: row.hasCursor
+                      font.bold: row.hasCursor || row.isSection
                       elide: Text.ElideRight
                     }
 

@@ -1,127 +1,141 @@
-# Understudy v0.1 — status
+# Understudy v0.2 — status
 
-- **Branch:** `feat/v0.1`, pushed to https://github.com/ninepointlabs/understudy (public) and merged to `main` through PR #1
-- **Code commit:** `7cdce3e` ("Understudy v0.1: make a second Omarchy laptop match the main one"), followed by this STATUS.md,
-  committed as Nine Point Labs <179739321+ninepointlabs@users.noreply.github.com>
+- **Branch:** `feat/v0.2`, from `origin/main` at `ed51af4` (v0.1 merged). PR https://github.com/ninepointlabs/understudy/pull/2 to `main`, not merged; for Tim to review.
+- Commits are by Nine Point Labs <179739321+ninepointlabs@users.noreply.github.com>.
+- Manifest version 0.2.0. The list format stays `format = 1`: `category` is an optional key, so v0.1 lists still import here and
+  v0.1 secondaries ignore it.
 
 ## What was built
 
-| File | What |
+| Feature | Where |
 |---|---|
-| `manifest.json` | id `ninepointlabs.understudy`, name Understudy, 0.1.0, MIT, kinds `["overlay"]` (no service needed) |
-| `Understudy.qml` | the overlay: role switch (Main/Secondary), main view (scan, export, export to path, auto-export toggle), secondary view (grouped missing items with checkboxes and notes, dry-run pane, install confirm → terminal, import from path, show all), folder prompt. Keyboard-driven; uses the shell's menu theme tokens, no hardcoded colors |
-| `UnderstudyModel.js` | pure model: parsing helper output, default ticks, tick/untick → ignore/unignore, grouping, navigation |
-| `bin/understudy` | the helper: `role`, `status`, `config`, `scan`, `export`, `import`, `diff`, `plan`, `apply`, `terminal`, `ignore`/`unignore`; no args toggles the overlay |
-| `tests/` | `main_test.sh`, `secondary_test.sh`, `model_test.sh`, shared `lib.sh` stubs, `fixtures/list.toml`, `snapshots/plan.txt` |
-| `README.md`, `LICENSE` | install + removal, key binding, menu entry, both roles, Syncthing setup, plain-file fallback, dry run, sample list, safety, dependencies |
+| **Categories.** Every item gets one of Gaming, Dev, CLI/TUI, Office, Media, Internet/Communication, System/Hardware, Themes/Look, Other. Main writes it into the list; the secondary works it out when the list has none (or one it doesn't know) | `bin/understudy` `categorize()`, `package_facts()`, `set_categories()`; `scan`, `export`, `diff` |
+| **Overrides** in `~/.config/understudy/config.toml` `[categories]` (`"package:steam" = "Other"`); `understudy category KEY CATEGORY`, `--clear`, and no args to list. The secondary's override wins over main's category | `cmd_category`, `read_config`/`write_config` |
+| **Skip by type**: `skip_categories = ["Gaming"]`, `understudy skip CATEGORY` / `unskip`, and in the overlay `C` → Space per category | `diff()`, `left_out()`, `cmd_skip`; QML category panel |
+| **Removed on main**: history of lists read on the secondary in `~/.local/state/understudy/history.json` (last 50); a reminder section with a copyable remove command per item; `X` / `understudy dismiss KEY` (`undismiss`) | `record_history`, `removed_on_main`, `cmd_removed`, `cmd_dismiss` |
+| **Menu entry**: `understudy setup omarchy` / `understudy remove omarchy`, a marked block in `~/.config/omarchy/extensions/omarchy-menu.jsonc` | `cmd_setup`, `cmd_remove`, `jsonc_scan`, `omarchy_menu_parse` |
+| **Overlay**: sections by category with counts (`N · x to install · y ticked`), fold with ←/→ or Space on a section, `C` category panel (skip checkboxes on the secondary, Enter = show only that category), `G` switches back to v0.1's by-type grouping, "Removed on main" section with `Y` copy (via `wl-copy`) and `X` dismiss | `Understudy.qml`, `UnderstudyModel.js` (`buildCategoryRows`, `buildMainCategoryRows`, `buildCategoryPanelRows`, `toggleSkip`, `toggleCollapsed`, …) |
+| README: install and removal steps with `setup omarchy` / `remove omarchy`, categories, overrides, skipping, Removed on main, new keys and commands, list sample with `category` | `README.md` |
 
 ### Decisions (flagged)
 
-- **Helper is Python 3, standard library only** (not bash + jq like NPL Inventory). The secondary must parse an untrusted TOML
-  file; `tomllib` does that properly and bash cannot. It runs as `/usr/bin/python3 -I -S` (shebang and overlay argv), so a
-  mise/conda Python on PATH is never used.
-- **Settings live in `~/.config/understudy/config.toml`** (role, folder, label, auto_export), not in shell.json. Shell plugin
-  settings are inline entries in `shell.json` aimed at bar widgets; a file of our own keeps the helper usable from a terminal and
-  means Understudy never writes the shell's file.
-- **"Enabled on main"** = `omarchy plugin list --json` `.enabled` **or** id in `shell.json plugins[]`. On TUF, `plugins[]` lists only 6
-  of the 13 enabled plugins (bar widgets placed in the bar are enabled but not in `plugins[]`), so `plugins[]` alone would have
-  turned most of them off on the secondary. It is used alone only when the shell isn't running.
-- **Installer mapping rule** (built from `$OMARCHY_PATH/bin/omarchy-install-*` at runtime): a package maps to an installer when it is
-  the first literal package that installer (or one `case` branch of it, e.g. `browser brave`) adds, and it appears in no other
-  installer. `omarchy-install-terminal`'s `omarchy-pkg-add $package` maps each choice to the same-named package. Skipped as
-  generic or out of scope: `install-app`, `install-and-launch`, `install-font`, `install-preinstalls`, `install-dev-env` (mise),
-  `install-docker-dbs`, `install-gaming-gpu-lib32`, and anything whose args are flags (`hermes-cli`, `openclaw-cli`).
-- **Defaults** = the two `.packages` lists + the dependency closure of `omarchy`/`omarchy-settings` (via `pacman -Qi`, following
-  `Provides`) + the first pacstrap line. That is why "beyond defaults" on TUF is 63, not the 71 you get from the two lists alone.
-- **AUR** = `pacman -Qqm` minus defaults, as briefed (25 on TUF; 24 of those are explicit).
-- **Unticking remembers** the item in `~/.config/understudy/ignore` (it stays in view for the rest of that visit, then hides; H shows
-  it, ticking it un-ignores it). Hardware items start unticked and ticking/unticking them is not remembered.
-- **Credentials in a git remote** (anything before `@` in an https URL, user:pass or a token) make export **refuse** for the whole
-  list, naming the item, never echoing the secret. Web apps whose URL query looks like it carries a token are left out with a warning.
-- **Private repos** are detected at export with an anonymous `git -c credential.helper= ls-remote` (parallel, 15 s timeout each);
-  `--offline` skips it and the overlay's scan is always offline. For my TUF runs I used `--offline` only, to stay within the
-  read-only commands the brief lists, so private detection is verified with stubs only.
-- **Install terminal** = `setsid uwsm-app -- xdg-terminal-exec --app-id=org.omarchy.terminal --title=Understudy -e /usr/bin/python3 -I -S
-  <helper> apply --hold --list <path> --only <keys…>` — the same launcher shape as `omarchy-launch-floating-terminal-with-presentation`,
-  but as an argv with no `bash -c` string.
-- Commands run as the direct binaries (`omarchy-pkg-add`, `omarchy-theme-install`, …) rather than `omarchy pkg add`; the dry run
-  shows exactly what runs.
-- Hardware marking is applied again on the secondary (kernel/ucode/dkms/driver/g14 patterns + `$OMARCHY_PATH/install/hardware/**`),
-  and whether a just-added plugin is a whole bar is read from the shell after it is installed, not from the list, so a list
-  cannot get a bar switched on.
+- **Category order of precedence**: user override → known names (a built-in list, plus `omarchy-install-gaming-*` etc. by installer
+  name, plus name patterns such as `ttf-*` fonts → Themes/Look, `wine*`/`proton*` → Gaming, `python-*`/`*-sdk` → Dev) → hardware-specific
+  → `.desktop` Categories → **terminal-only program** (files in `/usr/bin`, no `.desktop`) → pacman groups → description keywords →
+  Other. The brief listed the terminal-only rule without a slot; I put it right after `.desktop` because "has a binary and no
+  launcher" is as hard a fact as a `.desktop` file and much more reliable than description keywords. Themes are always Themes/Look,
+  TUI launchers always CLI/TUI, a whole-bar plugin Themes/Look, a web app with nothing else to go on Internet/Communication.
+- **Where the facts come from.** Main: `pacman -Qi` (already read; now also Groups and Description) and one `pacman -Ql -- names…`
+  call; `.desktop` files are read from `$XDG_DATA_DIRS/applications`; Flatpaks from their exported `.desktop`; plugins from their
+  manifest's `description`. Secondary (only for items with no usable category): `pacman -Si -- names…` for packages it does not
+  have (description and groups; no `.desktop` without the files db), `-Qi`/`-Ql` for ones it does.
+- **Skipped = folded and unticked** (both). The section starts folded, so the Surface opens without Gaming in view, and when Tim
+  unfolds it nothing in it is ticked. `plan`/`apply` with no `--only` never include a skipped item and the plan says
+  "Left out: N items in categories this machine skips (Gaming)". Only keys passed with `--only` — which the overlay builds from what
+  Tim ticked by hand — can include one. Hiding alone would make "show it, then tick it" awkward; unticked alone would leave a
+  long Gaming section on the Surface every time.
+- **Removed on main: reminder only, no uninstall action.** Each item shows a command to copy: `omarchy pkg drop NAME` for packages,
+  AUR packages and installers (the installer's own package), `omarchy theme remove`, `omarchy plugin remove`,
+  `omarchy webapp remove`, `omarchy tui remove`, `flatpak uninstall`, `rm ~/Applications/NAME.AppImage`. For installers I did **not**
+  suggest Omarchy's `omarchy remove …` scripts: some delete data (`omarchy-remove-gaming-steam` deletes `~/.steam` and the game
+  libraries). Understudy runs none of these.
+- **What counts as "Removed on main"**: in a list from main older than the current one, not in the current one, not dismissed,
+  and present here: packages installed **explicitly** (`pacman -Qqe`, so nothing that is only a dependency) and **not an Omarchy
+  default on this machine** (same default set as main uses); user theme folders (not built-ins); user plugin folders (not
+  `omarchy.*`); web app / TUI `.desktop` files; Flatpaks; AppImages. I read "(or that are non-default here)" as a filter on
+  "installed", not as "anything this machine added that main doesn't have" — the latter would list the Surface's own hardware
+  packages as "removed on main".
+- **History**: recorded when the secondary reads its list (from the shared folder or the imported copy; `diff`, which the overlay
+  runs on every open) and on `import`. Once per list, keyed by `generated_at`; a list named with `--list` is a one-off and not
+  recorded. The first v0.2 run on the Surface has no history, so the section stays empty until main exports a changed list (the
+  last imported copy, if older, is recorded too). Dismissals are in `config.toml` (`dismissed = [...]`), not the ignore file:
+  "don't offer to install" and "don't remind me it was dropped" are different.
+- **Menu**: the block goes right after the top-level `{` (as OmaForge does). The `when` is
+  `test -f "$HOME/.config/omarchy/plugins/ninepointlabs.understudy/manifest.json"`. Setup removes any top-level `"understudy"`
+  entry outside the markers (one-line or multi-line, found with a small JSONC scanner that skips strings and comments), and
+  `"install.understudy"` only when its value toggles `ninepointlabs.understudy` (v0.1's README suggested that key). Remove takes out
+  the block and those same entries when they toggle Understudy. Unlike OmaForge it does not rewrite or back up when nothing would
+  change, so running it twice leaves one backup, not two. It refuses (and changes nothing) when the file is not a JSONC object it
+  can read, and checks the result parses the way Omarchy's `MenuModel.js` parses it (whole-line `//` comments and trailing commas
+  stripped, then JSON) with no repeated key. File mode is kept; backups are `omarchy-menu.jsonc.bak.<YYYYmmdd-HHMMSS>[-n]`.
+- **No category override in the overlay** — helper command only, as the brief asked. Easy to add (a key on an item) if wanted.
+- **v0.1 by-type grouping kept** behind `G`, so the old view (and its model tests) still work.
+
+### Fixed along the way
+
+- In `tests/lib.sh`, `us` was a shell function, so checks written `check "…" bash -c '! "$@"' _ us …` (bad role, hostile folder,
+  bad ignore key, …) ran a command that didn't exist and passed whatever the helper did. `us` and the variables it needs are now
+  exported, and `main_test.sh` checks the helper really runs inside `bash -c`. All of those checks still pass, now for real.
+- `tests/fixtures/list.toml` is renamed `list-v0.1.toml` (it is the v0.1 shape, the "old list" fixture); `list-v0.2.toml` is new.
+- `KEEP_ROOT=1 tests/…_test.sh` keeps the throwaway world for debugging.
 
 ## Verification
 
 | Check | Result |
 |---|---|
+| `tests/main_test.sh` | **92 passed**, 0 failed (v0.1: 61) |
+| `tests/secondary_test.sh` | **140 passed**, 0 failed (v0.1: 73) |
+| `tests/model_test.sh` (node) | **68 passed**, 0 failed (v0.1: 34) |
+| `tests/menu_test.sh` (new) | **43 passed**, 0 failed |
+| Total | **343 passed**, 0 failed |
 | `omarchy plugin validate .` | passes (silent, exit 0) |
-| `qmllint -I "$OMARCHY_PATH/shell" *.qml` (`/usr/lib/qt6/bin/qmllint`; not on PATH) | exit 0; 49 warnings, all the same classes NPL Inventory's overlay has (80 there): `unqualified` access to the shell's `Style`/`Util` singletons and to `parent` inside `qs.Ui` types, and `ConfirmDialog.selectedIndex` "missing" — qmllint can't resolve the `qs.*` imports. Not clean, but nothing new in kind |
-| `tests/main_test.sh` | 61 passed, 0 failed |
-| `tests/secondary_test.sh` | 73 passed, 0 failed |
-| `tests/model_test.sh` (node) | 34 passed, 0 failed |
-| Symlinks in repo | none |
-| Headless QML load | **not done** — NPL Inventory has none to copy, and loading the overlay needs the running shell (`qs.*` imports); I did not install it into your live config |
+| `qmllint -I "$OMARCHY_PATH/shell" Understudy.qml` | 49 warnings, the same as v0.1 in number and kind (48 `unqualified`, 1 `missing-property`: the `qs.*` singletons and `ConfirmDialog.selectedIndex`); no new kinds |
+| Plan snapshot (`tests/snapshots/plan.txt`) | unchanged |
 
-Tests cover: default set (lists, closure, pacstrap) and diff, installer mapping (incl. case branches, `$package`, ambiguity, flag
-installers), hardware marking (repo, patterns, Omarchy hardware scripts, re-marked on secondary), themes/plugins/launchers/flatpak/
-AppImage detection, hidden `.bak` plugin folders not shadowing real ones, manifest round-trip, no personal paths/hostname in the
-file, credentials refusal, hostile lists (bad names, `--`/`-` options, `ext::`, `file://`, `http://`, creds, `git@…:-o…`, `..`,
-`/` in names, multi-line TUI command, wrong types, duplicates, >1 MiB, wrong format, non-TOML, checker refusal/absence), command
-building, dry-run snapshot, apply order, "no" and EOF answers, stop on first failure, theme + background switch-back, existing-theme
-skip, whole-bar plugin not enabled, terminal argv, shared-folder-missing fallback, newer-list-wins, ignore file. Every external
-command is a stub; the helper's PATH holds only stubs and a few coreutils (Omarchy installs its commands into `/usr/bin`, so
-`/usr/bin` is deliberately not on it).
+New tests cover: the category of each kind and each rule (known names, installer names, hardware, `.desktop` Categories, terminal-only
+programs, Flatpak `.desktop`, plugin description words, whole-bar plugins, web apps, groups and description via `pacman -Si` on the
+secondary), main writing categories into the list, overrides on main (into the list) and on the secondary (winning over main's),
+`--clear`, bad keys and categories refused, a v0.1 list (all 23 items read, every one categorized here), a v0.2 list (main's category
+kept, an unknown one re-derived), skip/unskip (config, any case, order, unknown refused), skipped items shown but unticked, left out of
+`plan`/`apply` with the "Left out" line, included when passed by hand; history recorded once per list, not for `--list`, on `import`,
+capped at 50, a tampered or non-JSON history file; Removed on main per kind with its command, not for Omarchy defaults, dependencies,
+built-in themes, items not here or still on main, nothing run or removed, dismiss/undismiss, older-list ordering; menu setup on no
+file, on a copy of the menu file shaped like both laptops' (hand-added line replaced, OmaForge and HEY blocks byte-identical, every
+other line and comment kept, backup equals the original, mode kept), idempotent setup and remove, round trip, multi-line and
+`install.understudy` hand entries, look-alike keys left alone, an unreadable file refused untouched, and that the real menu file is
+never the one used. The model tests cover parsing categories/removed/skip, folded sections, filter, panel rows, skip toggling,
+section navigation, and that skipped items are never remembered as ignored.
 
-## TUF scan summary (counts only, `scan --offline`)
+Read-only on TUF: `scan --offline` puts the 83 items in all nine categories (e.g. Gaming 9: steam and lutris installers, OmaForge,
+ProtonUp-Qt…; Themes/Look 15; System/Hardware 9 incl. the g14 packages). `diff --list ./tmp/understudy.toml` (TUF's own v0.1 export)
+reads all 83 with 0 errors and works out every category. Nothing was written to `~/.config/understudy`, `~/.local/state/understudy`
+(still absent), `~/.config/omarchy` or the installed plugin copy. The real `omarchy-menu.jsonc` is byte-identical to the fixture I
+copied from it.
 
-- Omarchy 4.0.6-1, first install 2026-08-19
-- 227 explicit packages · 63 beyond all defaults (71 beyond the two `.packages` lists alone) · 25 foreign
-- Omarchy installers 12 · repo packages 20 (3 hardware-specific) · AUR 25 (1 hardware-specific)
-- Themes 12 (11 with git URL, 1 manual) · plugins 14 (11 with git URL, 3 manual)
-- Web apps 0 · TUI launchers 0 · Flatpaks 0 (flatpak not installed) · AppImages 0
-- Exported to `./tmp/understudy.toml` (gitignored, not committed): 83 entries; `diff` against TUF itself reports everything as
-  already here, `plan` says "Nothing to install". No home paths or credentials in the file.
-- Nothing was written to `~/.config/understudy`, `~/.local/state/understudy`, `~/.config/omarchy`, bindings or menu.
+## Hand test
 
-## Hand-test on the Surface
+On TUF (main):
 
-1. On TUF: `omarchy plugin add https://github.com/ninepointlabs/understudy.git --enable`, open the overlay, press M (Main), then S to scan.
-   Check the counts match the summary above.
-2. Set up `~/Sync/understudy` in Syncthing and share it with the Surface (README, "Set up the shared folder"). Press Enter to export.
-   Open the file and read it: names and URLs only.
-3. On the Surface: install the plugin, accept the Syncthing share at the same path, open Understudy, press S (Secondary).
-4. Check: btop-style packages already there show only with H; `asusctl`, `rog-control-center`, `supergfxctl` show as
-   hardware-specific and unticked (and `needs the [g14] repo` where the Surface lacks it); grok theme and the npl-inventory,
-   update-arcade and omostrich plugins show "manual: no source URL"; private repos say they need `gh auth login`.
-5. Untick one item, close and reopen: it is gone; H shows it as ignored.
-6. Press D and read the commands. Then tick a small set (one repo package, one theme, one plugin) and press Enter → Open terminal.
-   The terminal prints the plan and asks `Continue? [y/N]`; answer y. pacman asks for the password there.
-7. After it finishes: your theme and background are the ones you had; the plugin is enabled only if it was on TUF; reopening the
-   overlay shows those items as installed.
-8. Fallback: `understudy export /some/stick/` on TUF and `understudy import /some/stick/understudy.toml` on the Surface.
+1. Update the installed copy (`git -C ~/.config/omarchy/plugins/ninepointlabs.understudy pull` once merged, or check out
+   `feat/v0.2` there), then `~/.config/omarchy/plugins/ninepointlabs.understudy/bin/understudy setup omarchy`. It should say it
+   backed up the menu. Open the Omarchy menu: one Understudy row, OmaForge, HEY and Barkeep still there. Run it again: "already in
+   the Omarchy menu".
+2. Open Understudy: sections by category with counts. ←/→ folds, G switches to by-type and back, C → Enter on Gaming shows only
+   Gaming, C → Enter on All shows everything.
+3. `understudy category package:discord Media`, rescan (S): discord is under Media. Export (Enter). `--clear` it afterwards.
+
+On the Surface (secondary):
+
+4. Update the plugin, run `understudy setup omarchy` as on TUF.
+5. Open Understudy: sections by category. Press C, Space on Gaming ("skipped on this laptop"), Esc: Gaming is folded; → unfolds it
+   with nothing ticked. D: no Steam/Lutris commands, and a "Left out: … (Gaming)" line. Tick one Gaming item by hand, D: it is there.
+6. Close and reopen: Gaming still folded (`skip_categories = ["Gaming"]` in `~/.config/understudy/config.toml`).
+7. Removed on main, without changing TUF: once the Surface has read the current list, copy it
+   (`cp ~/Documents/understudy/understudy.toml /tmp/u.toml`), delete one entry the Surface has installed (e.g. a `[[packages]]`
+   block), make `generated_at` later, and `understudy import /tmp/u.toml`. Reopen: the item is under "Removed on main" with e.g.
+   `omarchy pkg drop NAME`. Y copies it (paste to check), X hides it. Nothing is removed. Export on TUF again afterwards (or
+   `rm ~/.local/state/understudy/imported.toml`) to go back to the real list.
+8. `understudy remove omarchy` and `understudy setup omarchy` once each, to see both work on the real file (each keeps a backup).
 
 ## Caveats
 
-- The overlay was not run inside the shell (not installed, per the brief), so its layout, key handling and focus are untested
-  beyond qmllint and the model tests. Most likely spots to need a tweak: the prompt bar, the plan pane's scrolling, and the
-  role-chooser buttons.
-- `pacman -Sl` repo attribution takes the first repo listing a package; on TUF `supergfxctl` shows `[omarchy]` because that repo
-  is listed before `[g14]`. Harmless (it is still marked hardware-specific), but the repo label can be the "wrong" one.
-- Packages in one group are installed with a single `omarchy-pkg-add a b c`; one bad name fails the whole group (then it stops).
-- Omarchy installers may themselves prompt, open apps or start services (e.g. Tailscale runs `tailscale up`). That is the point of
-  using them, but the terminal session can be interactive.
-- TUI launchers carry a command line that runs when the launcher is opened; it is validated (printable, ≤512 chars, no newline,
-  no leading `-`) and shown in full, but it is a command by nature.
-- Flatpak installs use `flatpak install <remote> <id>` (system-wide by default), as briefed.
-- Anonymous private-repo detection treats "gone" and "private" the same.
-
-## Before a marketplace submission
-
-- The repo is public at https://github.com/ninepointlabs/understudy, matching the README install URL.
-- No `preview.png` (couldn't render the overlay without installing it). Optional, but worth adding after the Surface test.
-- Check the id/name against the live registry (publish skill step 2) — I did not fetch the registry.
-- Expect `review-required`: README and code mention `sudo`, `omarchy pkg add`/`omarchy-pkg-add`, `yay`, `pacman` (→ `privilege`,
-  `package-manager`, likely `installer`).
-- A hand test on real hardware (above) should precede submission.
+- The overlay still has not been run inside the shell (same as v0.1): layout, key handling and the new section rows are covered by
+  the model tests and qmllint only. Likely spots for a tweak: the longer key hints in the footer (they may crowd the status text on
+  a narrow screen) and focus after the C panel closes.
+- Categories are heuristics. On TUF a few land oddly (Barkeep → System/Hardware from its description, the Understudy plugin itself →
+  Internet/Communication from "sync"); overrides are the fix. The known-names list is short on purpose.
+- Removing an item from the list on main by hand-editing the file changes nothing until `generated_at` changes (history is per list).
+- `wl-copy` is assumed for Y (it is on stock Omarchy); if it fails the overlay says so.
+- Everything in v0.1's caveats still applies.
 
 DONE

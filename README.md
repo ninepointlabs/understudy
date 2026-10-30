@@ -8,8 +8,11 @@ web apps and TUI launchers (and Flatpaks and AppImages, if you have any). It
 writes that list to one plain, readable file in a shared folder.
 
 On the **second** laptop, Understudy reads the file, shows only what is
-missing there, lets you tick what you want, shows exactly what will run, and
-then installs it in a terminal. It never removes anything.
+missing there, grouped by what it is for (Gaming, Dev, Media…), lets you tick
+what you want, shows exactly what will run, and then installs it in a
+terminal. Categories you never want there (say, Gaming on a work laptop) can
+be skipped. It never removes anything: when the main laptop drops something,
+Understudy only reminds you, with the command to remove it yourself.
 
 ## What it does not do
 
@@ -27,9 +30,11 @@ then installs it in a terminal. It never removes anything.
 
 ```bash
 omarchy plugin add https://github.com/ninepointlabs/understudy.git --enable
+~/.config/omarchy/plugins/ninepointlabs.understudy/bin/understudy setup omarchy
 ```
 
-Do this on both laptops.
+Do this on both laptops. The second line adds Understudy to the Omarchy menu
+(see below); leave it out if you don't want that.
 
 ### Open it
 
@@ -47,18 +52,32 @@ o.bind("SUPER + SHIFT + U", "Understudy", "omarchy-shell shell toggle ninepointl
 `SUPER + SHIFT + U` is free in stock Omarchy; check `omarchy menu keybindings
 --print` if you have your own bindings.
 
-To put it in the Omarchy menu under **Install**, add one entry to
-`~/.config/omarchy/extensions/omarchy-menu.jsonc`:
+`understudy setup omarchy` puts it in the Omarchy menu. It writes one marked
+block to `~/.config/omarchy/extensions/omarchy-menu.jsonc` (creating the file
+if there is none), the same way OmaForge and HEY do:
 
 ```jsonc
-"install.understudy": {"icon": "󰑓", "label": "Understudy", "description": "Make this laptop match the main one", "action": "omarchy-shell shell toggle ninepointlabs.understudy"},
+  // >>> understudy — managed by `understudy setup omarchy`, do not edit between the markers
+  "understudy": {"icon":"󰌢","label":"Understudy","description":"Make this Omarchy laptop match the main one","action":"omarchy-shell shell toggle ninepointlabs.understudy","when":"test -f \"$HOME/.config/omarchy/plugins/ninepointlabs.understudy/manifest.json\""},
+  // <<< understudy
 ```
+
+The row only shows while the plugin is installed. Running it again changes
+nothing; every other entry and comment in the file is left as it is, and the
+old file is kept next to it as `omarchy-menu.jsonc.bak.<date>`. An
+`"understudy"` entry you added by hand (or the `"install.understudy"` one
+v0.1's README suggested) is replaced, so there is never a second one.
 
 ## Remove
 
 ```bash
+~/.config/omarchy/plugins/ninepointlabs.understudy/bin/understudy remove omarchy
 omarchy plugin remove ninepointlabs.understudy
 ```
+
+The first line takes Understudy out of the Omarchy menu (with a backup of the
+file, as above). Run it before removing the plugin, while the helper is still
+there.
 
 Then delete Understudy's own files if you want them gone too:
 
@@ -67,8 +86,8 @@ rm -rf ~/.config/understudy ~/.local/state/understudy
 ```
 
 and the list in the shared folder (`~/Sync/understudy/understudy.toml`), and
-the key binding or menu entry if you added one. Nothing Understudy installed
-is removed; those are ordinary packages, themes and plugins.
+the key binding if you added one. Nothing Understudy installed is removed;
+those are ordinary packages, themes and plugins.
 
 ## Set up the shared folder
 
@@ -111,6 +130,9 @@ shared folder has a newer list later, the newer one wins.
 | Enter / E | export the list to the shared folder |
 | P | export to a path you type |
 | A | turn re-exporting on every open on or off (off by default) |
+| C | categories: Enter shows only one (All shows everything) |
+| G | group by category (the default) or by type |
+| ← / → , Space on a section | fold or unfold a category |
 | F | change the shared folder |
 | Tab | switch this laptop to Secondary |
 | Esc | close |
@@ -122,7 +144,11 @@ Scan and export change nothing on the main laptop except the list file.
 | Key | Does |
 |-----|------|
 | ↑ / ↓, PgUp / PgDn, Home / End | move |
-| Space | tick or untick |
+| Space | tick or untick (on a section: fold or unfold it) |
+| ← / → | fold or unfold the category the cursor is in |
+| C | categories: Space skips one on this laptop, Enter shows only one |
+| G | group by category (the default) or by type |
+| Y / X | on a "Removed on main" item: copy its remove command / stop reminding |
 | D | show the exact commands (dry run) |
 | Enter | install what is ticked (asks first, then opens a terminal) |
 | I | import a list from a path you type |
@@ -136,6 +162,64 @@ Each item has a short note: the repo it comes from, the URL, or why it can't
 be installed here. Anything you untick is remembered in
 `~/.config/understudy/ignore` and stops showing (H shows it again; ticking it
 brings it back).
+
+### Categories
+
+Every item has one: **Gaming**, **Dev**, **CLI/TUI**, **Office**, **Media**,
+**Internet/Communication**, **System/Hardware**, **Themes/Look** or
+**Other**. The main laptop works it out and writes it into the list; the
+second laptop works it out itself for a list that has none (one from v0.1).
+In order, the first that applies:
+
+1. your own override (below),
+2. a known name (Steam, Lutris, Heroic, ProtonUp-Qt, gamescope, MangoHud,
+   OmaForge, Wine… are Gaming; the `omarchy-install-gaming-*` installers too),
+3. hardware-specific items are System/Hardware; themes are Themes/Look; TUI
+   launchers are CLI/TUI,
+4. the `Categories` of the package's `.desktop` file (Game, Development,
+   Office, AudioVideo/Audio/Video/Graphics, Network/Chat/Email,
+   System/Settings),
+5. a program with no `.desktop` file is CLI/TUI,
+6. its pacman groups, then words in its description,
+7. Other.
+
+To put an item somewhere else, on either laptop:
+
+```bash
+understudy category package:steam Other     # set
+understudy category package:steam --clear   # back to Understudy's choice
+understudy category                         # list the categories and your overrides
+```
+
+Overrides live in `~/.config/understudy/config.toml` under `[categories]`.
+The main laptop's override goes into the list; the second laptop's own
+override wins over that.
+
+### Skipping a category
+
+Press `C` and tick **skip on this laptop** with Space, or run
+`understudy skip Gaming` (and `understudy unskip Gaming`). It is kept as
+`skip_categories = ["Gaming"]` in `config.toml`.
+
+A skipped category is **folded and unticked**: its section starts closed, so
+the list opens without it, and when you open it (→) nothing in it is ticked.
+`plan` and `apply` leave it out (the plan says how many it left out); only an
+item you tick by hand goes in.
+
+### Removed on main
+
+The second laptop remembers which items each list it has read had
+(`~/.local/state/understudy/history.json`, the last 50 lists). When the main
+laptop's list no longer has something an older one did, and this laptop has
+it (installed explicitly, and not an Omarchy default here), it shows under
+**Removed on main** with the command that would remove it, for example
+`omarchy pkg drop restic`, `omarchy plugin remove acme.weather` or
+`omarchy theme remove sunset`.
+
+That is all it does. Understudy never removes anything; copy the command
+(`Y`) and run it yourself if you want it gone. `X` (or
+`understudy dismiss KEY`) stops the reminder for that item; `understudy
+undismiss KEY` brings it back. `understudy removed` lists them in a terminal.
 
 ### What gets marked
 
@@ -236,29 +320,35 @@ label = "main"
 command = "omarchy-install-gaming-steam"
 args = []
 packages = ["steam"]
+category = "Gaming"
 
 # Repo packages
 [[packages]]
 name = "rclone"
 repo = "extra"
+category = "Internet/Communication"
 
 [[packages]]
 name = "asusctl"
 repo = "g14"
 hardware = true
+category = "System/Hardware"
 
 # AUR packages
 [[aur]]
 name = "orion-beta"
+category = "Internet/Communication"
 
 # Themes
 [[themes]]
 name = "sunset"
 source = "https://github.com/someone/omarchy-sunset-theme.git"
+category = "Themes/Look"
 
 [[themes]]
 name = "handmade"
 manual = true
+category = "Themes/Look"
 
 # Plugins
 [[plugins]]
@@ -266,7 +356,12 @@ id = "ninepointlabs.omasync"
 name = "OmaSyncthing"
 source = "https://github.com/ninepointlabs/omasync.git"
 enabled = true
+category = "Internet/Communication"
 ```
+
+`category` is new in v0.2 and optional: a v0.2 second laptop reads a v0.1
+list and works the categories out itself, and a v0.1 second laptop ignores
+them.
 
 Set the label with `understudy config label "tuf"`.
 
@@ -287,6 +382,11 @@ understudy plan [--json] [--list PATH] [--only KEY...]
 understudy apply [--list PATH] [--only KEY...]
 understudy terminal [--list PATH] [--only KEY...]
 understudy ignore KEY... | unignore KEY...
+understudy category [KEY CATEGORY | KEY --clear]
+understudy skip [CATEGORY] | unskip CATEGORY
+understudy removed [--json] [--list PATH]
+understudy dismiss KEY... | undismiss KEY...
+understudy setup omarchy | remove omarchy
 ```
 
 It lives at `~/.config/omarchy/plugins/ninepointlabs.understudy/bin/understudy`
@@ -316,8 +416,9 @@ offline.
   **Web apps** and **TUI launchers** are the `.desktop` files in
   `~/.local/share/applications` that Omarchy created and did not ship.
 - Settings are in `~/.config/understudy/config.toml` (role, folder, label,
-  auto-export), not in the shell's `shell.json`, so the helper works the same
-  from a terminal.
+  auto-export, skipped categories, dismissed reminders, category overrides),
+  not in the shell's `shell.json`, so the helper works the same from a
+  terminal.
 
 ## Dependencies
 
@@ -334,6 +435,7 @@ file, and Python's `tomllib` does that properly.
 tests/main_test.sh        # scan and export, against a fake main laptop
 tests/secondary_test.sh   # diff, dry run, apply, hostile lists, against a fake second laptop
 tests/model_test.sh       # the overlay's model, in node
+tests/menu_test.sh        # setup omarchy / remove omarchy, on copies of a menu file
 ```
 
 Every external command (pacman, yay, git, flatpak, sudo, the omarchy commands,
