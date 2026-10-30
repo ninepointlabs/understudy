@@ -1,0 +1,112 @@
+# A list as the main laptop would write it, for the secondary's tests.
+format = 1
+generated_at = "2026-10-30T12:00:00Z"
+omarchy_version = "4.0.6-1"
+label = "tuf"
+
+[[installers]]
+command = "omarchy-install-browser"
+args = ["brave"]
+packages = ["brave-bin"]
+
+[[installers]]
+command = "omarchy-install-gaming-steam"
+args = []
+packages = ["steam"]
+
+[[installers]]
+command = "omarchy-install-gaming-mystery"
+args = []
+packages = ["mystery"]
+
+[[packages]]
+name = "btop"
+repo = "extra"
+
+[[packages]]
+name = "rclone"
+repo = "extra"
+
+[[packages]]
+name = "restic"
+repo = "extra"
+
+[[packages]]
+name = "asusctl"
+repo = "g14"
+hardware = true
+
+[[packages]]
+name = "nvidia-dkms"
+repo = "extra"
+hardware = true
+
+[[packages]]
+name = "gone-pkg"
+repo = "extra"
+
+[[aur]]
+name = "my-aur-tool"
+
+[[flatpaks]]
+id = "com.example.Tool"
+remote = "flathub"
+
+[[flatpaks]]
+id = "org.other.App"
+remote = "otherremote"
+
+[[themes]]
+name = "sunset"
+source = "https://github.com/someone/omarchy-sunset-theme.git"
+
+[[themes]]
+name = "secret"
+source = "https://github.com/someone/omarchy-private-theme.git"
+private = true
+
+[[themes]]
+name = "handmade"
+manual = true
+
+[[themes]]
+name = "already"
+source = "https://github.com/someone/omarchy-already-theme.git"
+
+[[plugins]]
+id = "acme.weather"
+name = "Weather"
+source = "https://github.com/acme/omarchy-weather.git"
+enabled = true
+
+[[plugins]]
+id = "acme.off"
+name = "Off"
+source = "https://github.com/acme/off.git"
+
+[[plugins]]
+id = "acme.tallbar"
+name = "Tall Bar"
+source = "git@github.com:acme/tallbar.git"
+enabled = true
+bar = true
+
+[[plugins]]
+id = "acme.local"
+name = "Local"
+manual = true
+enabled = true
+
+[[webapps]]
+name = "Notes"
+url = "https://notes.example.com/app"
+
+[[tuis]]
+name = "Top"
+command = "btop"
+style = "float"
+icon = "utilities-terminal"
+
+[[appimages]]
+name = "Tool-1.0.AppImage"
+manual = true
