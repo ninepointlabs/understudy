@@ -1,6 +1,6 @@
 # Understudy v0.2 — status
 
-- **Branch:** `feat/v0.2`, from `origin/main` at `ed51af4` (v0.1 merged). PR https://github.com/ninepointlabs/understudy/pull/2 to `main`, not merged; for Tim to review.
+- **Branch:** `feat/v0.2`, from `origin/main` at `ed51af4` (v0.1 merged). PR https://github.com/ninepointlabs/understudy/pull/2 merged to `main` on 2026-10-30 as `8a5ea66`.
 - Commits are by Nine Point Labs <179739321+ninepointlabs@users.noreply.github.com>.
 - Manifest version 0.2.0. The list format stays `format = 1`: `category` is an optional key, so v0.1 lists still import here and
   v0.1 secondaries ignore it.
