@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "id": "ninepointlabs.understudy",
+  "name": "Understudy",
+  "version": "0.1.0",
+  "author": "Nine Point Labs",
+  "license": "MIT",
+  "description": "Make a second Omarchy laptop match the main one. On the main laptop it lists the packages, Omarchy installers, themes, plugins, web apps and TUI launchers added since the first install and writes them to one plain file in a shared folder; on the second it shows what is missing, the exact commands, and installs the ones you tick in a terminal. Never removes anything.",
+  "kinds": [
+    "overlay"
+  ],
+  "keepLoaded": false,
+  "entryPoints": {
+    "overlay": "Understudy.qml"
+  }
+}

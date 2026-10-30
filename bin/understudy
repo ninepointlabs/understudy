@@ -1,0 +1,1698 @@
+#!/usr/bin/python3 -IS
+
+"""understudy — make a second Omarchy laptop match the main one.
+
+  understudy                         toggle the overlay
+  understudy role [main|secondary]   show or set this machine's role
+  understudy status [--json]         role, shared folder, list file
+  understudy config KEY VALUE        folder PATH | label NAME | auto-export on|off
+  understudy scan [--json] [--offline]
+                                     what was added here after the first Omarchy install
+  understudy export [PATH] [--offline] [--force]
+                                     write the list (default: <folder>/understudy.toml)
+  understudy import [PATH]           check a list and keep a copy of it here
+  understudy diff [--json] [--list PATH]
+                                     what in the list is missing here
+  understudy plan [--json] [--list PATH] [--only KEY...]
+                                     the exact commands an install would run (dry run)
+  understudy apply [--list PATH] [--only KEY...] [--hold]
+                                     print the plan, ask, then install (in a terminal)
+  understudy terminal [--list PATH] [--only KEY...]
+                                     open an Omarchy terminal running `apply`
+  understudy ignore KEY... | unignore KEY...
+                                     stop (or start again) showing items on this machine
+
+Scan and export change nothing but the list file. Apply never removes,
+downgrades or overwrites anything, never runs sudo itself, and asks before it
+starts; pacman and yay ask for the sudo password in the terminal.
+
+Written in Python (standard library only) rather than bash + jq like NPL
+Inventory's helper, because the secondary has to parse an untrusted TOML file
+and tomllib does that properly.
+"""
+
+import datetime
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import tomllib
+import urllib.parse
+from pathlib import Path
+
+SELF_ID = "ninepointlabs.understudy"
+FORMAT = 1
+LIST_NAME = "understudy.toml"
+DEFAULT_FOLDER = "~/Sync/understudy"
+MAX_LIST_BYTES = 1024 * 1024
+MAX_ITEMS = 2000
+
+HOME = Path(os.environ.get("HOME") or Path.home())
+OMARCHY_PATH = Path(os.environ.get("OMARCHY_PATH") or "/usr/share/omarchy")
+CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME") or HOME / ".config") / "understudy"
+CONFIG_FILE = CONFIG_DIR / "config.toml"
+IGNORE_FILE = CONFIG_DIR / "ignore"
+STATE_DIR = Path(os.environ.get("XDG_STATE_HOME") or HOME / ".local/state") / "understudy"
+IMPORTED = STATE_DIR / "imported.toml"
+THEMES_DIR = HOME / ".config/omarchy/themes"
+PLUGINS_DIR = HOME / ".config/omarchy/plugins"
+SHELL_JSON = HOME / ".config/omarchy/shell.json"
+APPS_DIR = HOME / ".local/share/applications"
+OMARCHY_STATE = HOME / ".local/state/omarchy"
+CURRENT_THEME = OMARCHY_STATE / "current/theme.name"
+CURRENT_BG = OMARCHY_STATE / "current/background"
+
+# The order categories are listed in, and installed in.
+CATEGORIES = [
+    ("installers", "installer", "Omarchy installers"),
+    ("packages", "package", "Repo packages"),
+    ("aur", "aur", "AUR packages"),
+    ("flatpaks", "flatpak", "Flatpaks"),
+    ("themes", "theme", "Themes"),
+    ("plugins", "plugin", "Plugins"),
+    ("webapps", "webapp", "Web apps"),
+    ("tuis", "tui", "TUI launchers"),
+    ("appimages", "appimage", "AppImages"),
+]
+TABLE_OF = {kind: table for table, kind, _ in CATEGORIES}
+TITLE_OF = {kind: title for _, kind, title in CATEGORIES}
+
+# Generic installers that take free-form arguments, or that install something
+# out of scope for v0.1 (mise tools, drivers picked per GPU, Docker images).
+INSTALLER_SKIP = {
+    "omarchy-install-app",
+    "omarchy-install-and-launch",
+    "omarchy-install-font",
+    "omarchy-install-preinstalls",
+    "omarchy-install-dev-env",
+    "omarchy-install-docker-dbs",
+    "omarchy-install-gaming-gpu-lib32",
+}
+
+# Repos that only make sense on particular hardware ([g14] is asus-linux).
+HARDWARE_REPOS = {"g14"}
+HARDWARE_PATTERNS = [
+    r"^linux(-(lts|zen|hardened|rt|g14|surface|cachyos|mainline)[a-z0-9-]*)?(-headers)?$",
+    r"^linux-firmware(-.+)?$",
+    r"-ucode$",
+    r"-dkms(-git)?$",
+    r"^(mkinitcpio|limine|grub|efibootmgr|systemd-boot-.+|refind|sbctl)$",
+    r"^(lib32-)?nvidia",
+    r"^xf86-video-",
+    r"^(lib32-)?vulkan-(radeon|intel|nouveau|swrast)$",
+    r"^(asusctl|rog-control-center|supergfxctl)$",
+    r"^asus-",
+    r"surface",
+    r"tuxedo",
+    r"^framework-",
+    r"^(sof-firmware|alsa-firmware|thermald|intel-lpmd|intel-media-driver|libva-intel-driver)$",
+]
+
+PKG_RE = re.compile(r"^[a-z0-9@_+][a-z0-9@._+-]{0,127}$")
+ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+THEME_RE = re.compile(r"^[a-z0-9_][a-z0-9._+-]{0,63}$")
+APP_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._+()-]{0,63}$")
+ICON_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$")
+INSTALLER_RE = re.compile(r"^omarchy-install-[a-z0-9][a-z0-9-]{0,63}$")
+ARG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
+FLATPAK_ID_RE = re.compile(r"^[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]+){2,}$")
+REMOTE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+APPIMAGE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._+()-]{0,127}\.AppImage$")
+HOST_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9-]{0,62}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,62}[A-Za-z0-9])?)+$")
+KEY_RE = re.compile(r"^(installer|package|aur|flatpak|theme|plugin|webapp|tui|appimage):[A-Za-z0-9@._+=() -]{1,160}$")
+SECRET_QUERY_RE = re.compile(r"(token|key|secret|pass|auth|sig|session|code|cred)", re.I)
+
+
+class Fail(Exception):
+    def __init__(self, message, code=1):
+        super().__init__(message)
+        self.code = code
+
+
+# ------------------------------------------------------------------ helpers
+
+def run(argv, timeout=60, env=None):
+    """Runs argv (never through a shell); returns (rc, stdout, stderr)."""
+    try:
+        p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, env=env,
+                           stdin=subprocess.DEVNULL)
+        return p.returncode, p.stdout, p.stderr
+    except (OSError, subprocess.SubprocessError) as e:
+        return 127, "", str(e)
+
+
+def lines(argv, timeout=60):
+    rc, out, _ = run(argv, timeout)
+    if rc != 0:
+        return None
+    return [l.strip() for l in out.splitlines() if l.strip()]
+
+
+def have(cmd):
+    return shutil.which(cmd) is not None
+
+
+def c_env():
+    env = dict(os.environ)
+    env["LC_ALL"] = "C"
+    return env
+
+
+def tilde(path):
+    """A path for display, with the home folder written as ~."""
+    p = str(path)
+    h = str(HOME)
+    return "~" + p[len(h):] if p == h or p.startswith(h + "/") else p
+
+
+def expand(path):
+    p = str(path)
+    if p == "~" or p.startswith("~/"):
+        p = str(HOME) + p[1:]
+    return Path(p)
+
+
+def printable(s, limit):
+    return isinstance(s, str) and 0 < len(s) <= limit and not any(ord(c) < 32 or ord(c) == 127 for c in s)
+
+
+def is_hardware_name(name):
+    return any(re.search(p, name) for p in HARDWARE_PATTERNS)
+
+
+def theme_slug(url):
+    """The folder `omarchy theme install` clones a URL into."""
+    path = url
+    if "://" not in path and ":" in path and "/" not in path.split(":", 1)[0]:
+        path = path.split(":", 1)[1]
+    base = path.rstrip("/").rsplit("/", 1)[-1]
+    if base.endswith(".git"):
+        base = base[:-4]
+    base = re.sub(r"^omarchy-", "", base)
+    base = re.sub(r"-theme$", "", base)
+    return base.lower()
+
+
+# ------------------------------------------------------------------- config
+
+def read_config():
+    cfg = {"role": "", "folder": DEFAULT_FOLDER, "label": "main", "auto_export": False}
+    if CONFIG_FILE.is_file():
+        try:
+            data = tomllib.loads(CONFIG_FILE.read_text())
+        except (tomllib.TOMLDecodeError, OSError, UnicodeDecodeError) as e:
+            raise Fail(f"{tilde(CONFIG_FILE)} could not be read: {e}")
+        if data.get("role") in ("main", "secondary"):
+            cfg["role"] = data["role"]
+        if printable(data.get("folder"), 512):
+            cfg["folder"] = data["folder"]
+        if isinstance(data.get("label"), str) and re.match(r"^[A-Za-z0-9][A-Za-z0-9 ._-]{0,39}$", data["label"]):
+            cfg["label"] = data["label"]
+        if isinstance(data.get("auto_export"), bool):
+            cfg["auto_export"] = data["auto_export"]
+    return cfg
+
+
+def write_config(cfg):
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    text = (
+        "# Understudy settings for this machine. `understudy config` edits this file.\n"
+        f"role = {toml_str(cfg['role'])}\n"
+        f"folder = {toml_str(cfg['folder'])}\n"
+        f"label = {toml_str(cfg['label'])}\n"
+        f"auto_export = {'true' if cfg['auto_export'] else 'false'}\n"
+    )
+    atomic_write(CONFIG_FILE, text)
+
+
+def folder_path(cfg):
+    return expand(cfg["folder"])
+
+
+def read_ignore():
+    keys = set()
+    try:
+        for line in IGNORE_FILE.read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and KEY_RE.match(line):
+                keys.add(line)
+    except (OSError, UnicodeDecodeError):
+        pass
+    return keys
+
+
+def write_ignore(keys):
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    text = "# Items Understudy no longer offers on this machine, one per line.\n"
+    text += "".join(k + "\n" for k in sorted(keys))
+    atomic_write(IGNORE_FILE, text)
+
+
+def atomic_write(path, text):
+    path = Path(path)
+    fd, tmp = tempfile.mkstemp(prefix="." + path.name + ".", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+# ------------------------------------------------------------------ toml out
+
+def toml_str(s):
+    # A JSON string with every non-ASCII character escaped is a valid TOML
+    # basic string.
+    return json.dumps(str(s), ensure_ascii=True)
+
+
+def toml_value(v):
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, int):
+        return str(v)
+    if isinstance(v, list):
+        return "[" + ", ".join(toml_value(x) for x in v) + "]"
+    return toml_str(v)
+
+
+def render_list(doc):
+    out = [
+        "# Understudy list: what was added to an Omarchy laptop after its first install.",
+        "# Written by `understudy export`. Plain text; no secrets, settings or personal paths.",
+        f"format = {FORMAT}",
+        f"generated_at = {toml_str(doc['generated_at'])}",
+        f"omarchy_version = {toml_str(doc['omarchy_version'])}",
+        f"label = {toml_str(doc['label'])}",
+    ]
+    for table, _, title in CATEGORIES:
+        items = doc.get(table) or []
+        if not items:
+            continue
+        out.append("")
+        out.append(f"# {title}")
+        for item in items:
+            out.append(f"[[{table}]]")
+            for k, v in item.items():
+                if v is None or v == "" or (v is False and k in ("manual", "private", "hardware", "bar")):
+                    continue
+                out.append(f"{k} = {toml_value(v)}")
+    return "\n".join(out) + "\n"
+
+
+# ---------------------------------------------------------------- git URLs
+
+def check_url(url, what="source"):
+    """Returns an error message for a git URL Understudy will not use, or ''."""
+    if not printable(url, 512) or any(c.isspace() for c in url):
+        return f"{what} is not a usable URL"
+    if url.startswith("-"):
+        return f"{what} looks like an option"
+    if url.startswith("https://"):
+        parts = urllib.parse.urlsplit(url)
+        if "@" in parts.netloc:
+            return f"{what} has credentials in it"
+        if not HOST_RE.match(parts.hostname or "") or parts.port not in (None, 443):
+            return f"{what} has an unusable host"
+        if len(parts.path) < 2 or parts.query or parts.fragment:
+            return f"{what} is not a repository URL"
+        return ""
+    m = re.match(r"^git@([^:/]+):([A-Za-z0-9._~/-]+)$", url)
+    if m:
+        if not HOST_RE.match(m.group(1)) or m.group(2).startswith("-") or ".." in m.group(2):
+            return f"{what} is not a repository URL"
+        return ""
+    return f"{what} must be an https:// or git@ URL"
+
+
+def git_url_check(url):
+    """omarchy-git-url-check is the stock gate; a missing checker refuses."""
+    if not have("omarchy-git-url-check"):
+        return "omarchy-git-url-check is not installed"
+    rc, _, err = run(["omarchy-git-url-check", url], timeout=10)
+    return "" if rc == 0 else (err.strip().splitlines() or ["refused by omarchy-git-url-check"])[-1]
+
+
+def repo_source(folder):
+    """origin of a theme or plugin folder that is a git clone, else ''."""
+    folder = Path(folder)
+    if not (folder / ".git").exists():
+        return ""
+    rc, out, _ = run(["git", "-C", str(folder), "remote", "get-url", "origin"], timeout=10)
+    return out.strip() if rc == 0 else ""
+
+
+def clean_source(url):
+    """Refuses an https URL with anything before an @ in its host part (a
+    user:pass, or a token), and plain http. Returns (url, error)."""
+    if url.startswith(("https://", "http://")):
+        parts = urllib.parse.urlsplit(url)
+        if "@" in parts.netloc:
+            return url, "its git remote has credentials in the URL (user:pass@ or a token); fix it with `git remote set-url origin <url>`"
+    if url.startswith("http://"):
+        return url, "its git remote is plain http"
+    err = check_url(url)
+    return url, err
+
+
+def is_private(url):
+    """True when an anonymous clone is refused (private, or gone), False when
+    it works, None when it could not be told (ssh URLs, offline)."""
+    if not url.startswith("https://"):
+        return None
+    env = dict(os.environ)
+    env.update({"GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": "/bin/false", "SSH_ASKPASS": "/bin/false"})
+    rc, _, err = run(["git", "-c", "credential.helper=", "ls-remote", "--exit-code", "--", url, "HEAD"],
+                     timeout=15, env=env)
+    if rc == 0:
+        return False
+    if re.search(r"could not resolve|unable to access|timed out|network", err, re.I) and "403" not in err and "401" not in err:
+        return None
+    return True
+
+
+# ------------------------------------------------------------- the defaults
+
+def package_list_file(name):
+    out = set()
+    try:
+        for line in (OMARCHY_PATH / "install" / name).read_text().splitlines():
+            line = line.split("#", 1)[0].strip()
+            if line:
+                out.add(line)
+    except OSError:
+        pass
+    return out
+
+
+def pacman_info():
+    """name -> {deps, provides} for every installed package."""
+    rc, out, _ = run(["pacman", "-Qi"], timeout=120, env=c_env())
+    pkgs = {}
+    if rc != 0:
+        return pkgs
+    cur, field = None, None
+    for raw in out.splitlines():
+        if not raw.strip():
+            cur, field = None, None
+            continue
+        if raw[0].isspace() and field:
+            value = raw.strip()
+        elif ":" in raw:
+            field, value = raw.split(":", 1)
+            field, value = field.strip(), value.strip()
+        else:
+            continue
+        if field == "Name":
+            cur = pkgs.setdefault(value, {"deps": [], "provides": []})
+        elif cur is not None and field in ("Depends On", "Provides") and value != "None":
+            key = "deps" if field == "Depends On" else "provides"
+            cur[key] += [re.split(r"[<>=]", t, maxsplit=1)[0] for t in value.split()]
+    return pkgs
+
+
+def dependency_closure(roots, info):
+    provider = {}
+    for name, p in info.items():
+        provider.setdefault(name, name)
+        for pv in p["provides"]:
+            provider.setdefault(pv, name)
+    seen, todo = set(), [r for r in roots if r in info]
+    while todo:
+        n = todo.pop()
+        if n in seen:
+            continue
+        seen.add(n)
+        for d in info.get(n, {}).get("deps", []):
+            target = provider.get(d)
+            if target and target not in seen:
+                todo.append(target)
+    return seen
+
+
+def pacstrap_set():
+    """Packages named on the first pacstrap line of /var/log/pacman.log."""
+    try:
+        with open(os.environ.get("UNDERSTUDY_PACMAN_LOG", "/var/log/pacman.log"), errors="replace") as f:
+            for line in f:
+                m = re.search(r"\[PACMAN\] Running '(pacman .*)'", line)
+                if not m or " -r " not in m.group(1):
+                    continue
+                words = m.group(1).split()
+                names = []
+                for w in reversed(words):
+                    if w.startswith("-") or "/" in w:
+                        break
+                    names.append(w)
+                return set(names)
+    except OSError:
+        pass
+    return set()
+
+
+def defaults_set(info):
+    return (package_list_file("omarchy-base.packages")
+            | package_list_file("omarchy-other.packages")
+            | dependency_closure(["omarchy", "omarchy-settings"], info)
+            | pacstrap_set())
+
+
+def hardware_packages():
+    """Package names Omarchy's own hardware setup installs."""
+    out = set()
+    root = OMARCHY_PATH / "install/hardware"
+    if not root.is_dir():
+        return out
+    for f in sorted(root.rglob("*.sh")):
+        try:
+            text = f.read_text(errors="replace")
+        except OSError:
+            continue
+        text = text.replace("\\\n", " ")
+        for m in re.finditer(r"omarchy-pkg-(?:add|aur-add)\s+([^\n|&;)]*)", text):
+            out |= {w for w in m.group(1).split() if PKG_RE.match(w)}
+        for m in re.finditer(r"\b[A-Z_]*PACKAGES\s*\+?=\s*\(([^)]*)\)", text):
+            out |= {w.strip("\"'") for w in m.group(1).split() if PKG_RE.match(w.strip("\"'"))}
+    return out
+
+
+# --------------------------------------------------------- installer map
+
+def installer_map():
+    """Reads the installer scripts in $OMARCHY_PATH/bin and returns
+    {(command, arg): [packages]}, the packages being the literal ones each
+    (branch of an) installer adds, the first being the one it is for."""
+    found = {}
+    bindir = OMARCHY_PATH / "bin"
+    try:
+        scripts = sorted(p for p in bindir.iterdir() if INSTALLER_RE.match(p.name))
+    except OSError:
+        return found
+    for script in scripts:
+        if script.name in INSTALLER_SKIP:
+            continue
+        try:
+            text = script.read_text(errors="replace")
+        except OSError:
+            continue
+        m = re.search(r"^#\s*omarchy:args=(.*)$", text, re.M)
+        spec = m.group(1).strip() if m else ""
+        if spec and not re.match(r"^<[a-z0-9|-]+>$", spec):
+            continue  # free-form or flag arguments
+        choices = spec[1:-1].split("|") if spec else []
+        if any(c.startswith("-") for c in choices):
+            continue  # flags, not things to install
+        text = text.replace("\\\n", " ")
+        label = ""
+        for line in text.splitlines():
+            stripped = line.strip()
+            if choices:
+                lm = re.match(r"^([a-z0-9| -]+)\)\s*$", stripped)
+                if lm:
+                    label = lm.group(1).split("|")[0].strip()
+                    continue
+                if stripped == ";;":
+                    label = ""
+                    continue
+            pm = re.search(r"\bomarchy-pkg-(?:add|aur-add)\s+(.*)$", stripped)
+            if not pm or stripped.startswith("#"):
+                continue
+            # `package="$1"` then `omarchy-pkg-add $package`: each choice is
+            # the package of the same name (omarchy-install-terminal).
+            if choices and not label and re.match(r"^\"?\$\{?(1|package)\}?\"?([\s;]|$)", pm.group(1)):
+                for choice in choices:
+                    if PKG_RE.match(choice):
+                        found.setdefault((script.name, choice), [choice])
+                continue
+            pkgs = []
+            for w in pm.group(1).split():
+                if w in ("||", "&&", ";", "|") or w.startswith(("$", "\"", "'", "(", "#")):
+                    break
+                if PKG_RE.match(w):
+                    pkgs.append(w)
+            if not pkgs:
+                continue
+            if choices:
+                if label not in choices:
+                    continue
+                key = (script.name, label)
+            else:
+                key = (script.name, "")
+            found.setdefault(key, [])
+            found[key] += [p for p in pkgs if p not in found[key]]
+    return found
+
+
+def package_to_installer(imap):
+    """Maps a package to the installer it is the first package of, unless the
+    package appears in more than one installer (then it is ambiguous)."""
+    count = {}
+    for pkgs in imap.values():
+        for p in set(pkgs):
+            count[p] = count.get(p, 0) + 1
+    out = {}
+    for key, pkgs in imap.items():
+        if pkgs and count[pkgs[0]] == 1:
+            out[pkgs[0]] = key
+    return out
+
+
+# --------------------------------------------------------------------- scan
+
+def read_desktop(path):
+    entry, section = {}, ""
+    try:
+        for line in Path(path).read_text(errors="replace").splitlines():
+            line = line.strip()
+            if line.startswith("["):
+                section = line
+                continue
+            if section == "[Desktop Entry]" and "=" in line and not line.startswith("#"):
+                k, v = line.split("=", 1)
+                entry.setdefault(k.strip(), v.strip())
+    except OSError:
+        pass
+    return entry
+
+
+def scan_launchers(warnings):
+    shipped = set()
+    try:
+        shipped = {p.name for p in (OMARCHY_PATH / "applications").glob("*.desktop")}
+    except OSError:
+        pass
+    webapps, tuis = [], []
+    if not APPS_DIR.is_dir():
+        return webapps, tuis
+    for f in sorted(APPS_DIR.glob("*.desktop")):
+        if f.name in shipped or not f.is_file():
+            continue
+        entry = read_desktop(f)
+        ex = entry.get("Exec", "")
+        name = f.name[:-len(".desktop")]
+        if ex.startswith("omarchy-launch-webapp "):
+            try:
+                words = shlex.split(ex)
+            except ValueError:
+                continue
+            if len(words) != 2:
+                continue
+            url = words[1]
+            err = check_webapp_url(url)
+            if err or not APP_NAME_RE.match(name):
+                warnings.append(f"web app {name}: {err or 'its name has characters Understudy does not carry'}; left out")
+                continue
+            webapps.append({"name": name, "url": url})
+            continue
+        m = re.match(r"^xdg-terminal-exec --app-id=TUI\.(float|tile) -e (.+)$", ex)
+        if m:
+            icon = entry.get("Icon", "")
+            if not ICON_RE.match(icon):
+                icon = "utilities-terminal"
+            cmd = m.group(2)
+            if not APP_NAME_RE.match(name) or not printable(cmd, 512):
+                warnings.append(f"TUI launcher {name}: not carried (unusual name or command)")
+                continue
+            tuis.append({"name": name, "command": cmd, "style": m.group(1), "icon": icon})
+    return webapps, tuis
+
+
+def check_webapp_url(url):
+    if not printable(url, 2048) or any(c.isspace() for c in url):
+        return "unusable URL"
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme != "https":
+        return "URL is not https"
+    if "@" in parts.netloc or not HOST_RE.match(parts.hostname or ""):
+        return "URL has credentials or an unusable host"
+    for k, _ in urllib.parse.parse_qsl(parts.query, keep_blank_values=True):
+        if SECRET_QUERY_RE.search(k):
+            return "URL carries what looks like a secret in its query"
+    return ""
+
+
+def scan_appimages():
+    found = set()
+    skip = {"cache", ".cache", "build", "squashfs-root", "node_modules", ".git", "tmp"}
+    for root in (HOME / "Applications", HOME / ".local/bin"):
+        if not root.is_dir():
+            continue
+        for dirpath, dirnames, filenames in os.walk(root):
+            depth = len(Path(dirpath).relative_to(root).parts)
+            dirnames[:] = [] if depth >= 1 else [d for d in dirnames if d.lower() not in skip]
+            for fn in filenames:
+                if fn.endswith(".AppImage") and APPIMAGE_RE.match(fn):
+                    found.add(fn)
+    return [{"name": n, "manual": True} for n in sorted(found)]
+
+
+def plugin_folders():
+    """manifest id -> folder, for every folder under the user plugins dir."""
+    out = {}
+    if not PLUGINS_DIR.is_dir():
+        return out
+    for d in sorted(PLUGINS_DIR.iterdir()):
+        # Hidden folders are backups and staging copies, not plugins.
+        if d.name.startswith(".") or d.is_symlink() or not d.is_dir():
+            continue
+        try:
+            m = json.loads((d / "manifest.json").read_text())
+            if isinstance(m, dict) and isinstance(m.get("id"), str):
+                out.setdefault(m["id"], {"dir": d, "name": m.get("name") or "", "kinds": m.get("kinds") or []})
+        except (OSError, ValueError):
+            continue
+    return out
+
+
+def shell_enabled_ids():
+    try:
+        data = json.loads(SHELL_JSON.read_text())
+        return {p["id"] for p in data.get("plugins", []) if isinstance(p, dict) and isinstance(p.get("id"), str)}
+    except (OSError, ValueError, AttributeError):
+        return set()
+
+
+def plugin_list():
+    """`omarchy plugin list --json`, or None when the shell cannot answer."""
+    rc, out, _ = run(["omarchy-plugin-list", "--json"], timeout=20)
+    if rc != 0:
+        return None
+    try:
+        data = json.loads(out)
+        return data if isinstance(data, list) else None
+    except ValueError:
+        return None
+
+
+def scan(offline=False):
+    """Everything this machine added after its first Omarchy install."""
+    warnings = []
+    info = pacman_info()
+    explicit = set(lines(["pacman", "-Qqe"]) or [])
+    foreign = set(lines(["pacman", "-Qqm"]) or [])
+    if not explicit:
+        raise Fail("pacman -Qqe gave nothing; is this an Arch system?")
+    defaults = defaults_set(info)
+
+    repo_of = {}
+    for line in lines(["pacman", "-Sl"], timeout=60) or []:
+        parts = line.split()
+        if len(parts) >= 2:
+            repo_of.setdefault(parts[1], parts[0])
+
+    hw_pkgs = hardware_packages()
+
+    def hardware(name, repo=""):
+        return repo in HARDWARE_REPOS or name in hw_pkgs or is_hardware_name(name)
+
+    repo_cands = sorted(explicit - defaults - foreign)
+    aur_cands = sorted(foreign - defaults)
+
+    imap = installer_map()
+    by_pkg = package_to_installer(imap)
+    installers, covered = [], set()
+    for name in repo_cands + aur_cands:
+        key = by_pkg.get(name)
+        if not key:
+            continue
+        command, arg = key
+        if any(i["command"] == command and i["args"] == ([arg] if arg else []) for i in installers):
+            continue
+        installers.append({"command": command, "args": [arg] if arg else [], "packages": imap[key],
+                           "hardware": hardware(name, repo_of.get(name, ""))})
+        covered |= set(imap[key])
+
+    installers.sort(key=lambda i: (i["command"], i["args"]))
+    packages = [{"name": n, "repo": repo_of.get(n, ""), "hardware": hardware(n, repo_of.get(n, ""))}
+                for n in repo_cands if n not in covered]
+    aur = [{"name": n, "hardware": hardware(n)} for n in aur_cands if n not in covered]
+
+    # Themes: user folders, minus any named like a built-in.
+    builtin = set()
+    try:
+        builtin = {p.name for p in (OMARCHY_PATH / "themes").iterdir()}
+    except OSError:
+        pass
+    themes = []
+    if THEMES_DIR.is_dir():
+        for d in sorted(THEMES_DIR.iterdir()):
+            if d.name.startswith(".") or not d.is_dir() or d.name in builtin or not THEME_RE.match(d.name):
+                continue
+            src = repo_source(d)
+            item = {"name": d.name, "source": "", "manual": False, "private": False}
+            if src:
+                src, err = clean_source(src)
+                if err:
+                    if "credentials" in err:
+                        raise Fail(f"theme {d.name}: {err}. Nothing was exported.")
+                    item["manual"] = True
+                    warnings.append(f"theme {d.name}: {err}")
+                else:
+                    item["source"] = src
+            else:
+                item["manual"] = True
+            themes.append(item)
+
+    # Plugins: user plugins only, never omarchy.*.
+    plist = plugin_list()
+    folders = plugin_folders()
+    enabled_ids = shell_enabled_ids()
+    if plist is None:
+        warnings.append("omarchy plugin list did not answer (is omarchy-shell running?); read the plugin folders instead")
+        plist = [{"id": i, "name": f["name"], "kinds": f["kinds"], "enabled": i in enabled_ids, "firstParty": False}
+                 for i, f in folders.items()]
+    plugins = []
+    for p in sorted(plist, key=lambda p: str(p.get("id", ""))):
+        pid = p.get("id")
+        if not isinstance(pid, str) or pid.startswith("omarchy.") or p.get("firstParty") is True:
+            continue
+        if not ID_RE.match(pid):
+            warnings.append(f"plugin {pid!r}: unusual id; left out")
+            continue
+        folder = folders.get(pid)
+        src = repo_source(folder["dir"]) if folder else ""
+        kinds = p.get("kinds") or (folder["kinds"] if folder else [])
+        item = {"id": pid, "name": str(p.get("name") or "")[:80], "source": "", "manual": False, "private": False,
+                "enabled": bool(p.get("enabled")) or pid in enabled_ids, "bar": "bar" in kinds}
+        if src:
+            src, err = clean_source(src)
+            if err:
+                if "credentials" in err:
+                    raise Fail(f"plugin {pid}: {err}. Nothing was exported.")
+                item["manual"] = True
+                warnings.append(f"plugin {pid}: {err}")
+            else:
+                item["source"] = src
+        else:
+            item["manual"] = True
+        plugins.append(item)
+
+    if not offline:
+        from concurrent.futures import ThreadPoolExecutor
+        sourced = [item for item in themes + plugins if item["source"]]
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            for item, private in zip(sourced, pool.map(lambda it: is_private(it["source"]), sourced)):
+                item["private"] = private is True
+
+    webapps, tuis = scan_launchers(warnings)
+
+    flatpaks = []
+    if have("flatpak"):
+        for line in lines(["flatpak", "list", "--app", "--columns=application,origin"]) or []:
+            parts = line.split()
+            if len(parts) >= 2 and FLATPAK_ID_RE.match(parts[0]) and REMOTE_RE.match(parts[1]):
+                flatpaks.append({"id": parts[0], "remote": parts[1]})
+
+    first_install = ""
+    try:
+        first_install = datetime.date.fromtimestamp((OMARCHY_STATE / "done/first-run-user").stat().st_mtime).isoformat()
+    except OSError:
+        pass
+
+    return {
+        "omarchy_version": omarchy_version(),
+        "first_install": first_install,
+        "counts": {"explicit": len(explicit), "beyond_defaults": len(explicit - defaults), "foreign": len(foreign)},
+        "installers": installers,
+        "packages": packages,
+        "aur": aur,
+        "flatpaks": flatpaks,
+        "themes": themes,
+        "plugins": plugins,
+        "webapps": webapps,
+        "tuis": tuis,
+        "appimages": scan_appimages(),
+        "warnings": warnings,
+    }
+
+
+def omarchy_version():
+    out = lines(["pacman", "-Q", "omarchy"])
+    if out and len(out[0].split()) == 2:
+        return out[0].split()[1]
+    try:
+        return (OMARCHY_PATH / "version").read_text().strip()[:40]
+    except OSError:
+        return ""
+
+
+def list_doc(found, label):
+    doc = {
+        "generated_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "omarchy_version": found["omarchy_version"],
+        "label": label,
+    }
+    for table, _, _ in CATEGORIES:
+        doc[table] = found.get(table) or []
+    return doc
+
+
+# ------------------------------------------------------------- list in
+
+def load_list(path):
+    """Reads and validates an untrusted list. Returns (doc, items, errors):
+    items are the entries that passed, each with a key; errors name the ones
+    that did not."""
+    path = Path(path)
+    try:
+        size = path.stat().st_size
+    except OSError:
+        raise Fail(f"No list at {tilde(path)}.", 3)
+    if not path.is_file():
+        raise Fail(f"{tilde(path)} is not a file.")
+    if size > MAX_LIST_BYTES:
+        raise Fail(f"{tilde(path)} is {size} bytes; a list is never more than {MAX_LIST_BYTES}. Not read.")
+    try:
+        with open(path, "rb") as f:
+            raw = f.read(MAX_LIST_BYTES + 1)
+        data = tomllib.loads(raw.decode("utf-8"))
+    except (tomllib.TOMLDecodeError, UnicodeDecodeError, OSError) as e:
+        raise Fail(f"{tilde(path)} is not a readable Understudy list: {e}")
+    if data.get("format") != FORMAT:
+        raise Fail(f"{tilde(path)} is not an Understudy list (format {data.get('format')!r}, expected {FORMAT}).")
+
+    def text(key, limit=80):
+        v = data.get(key)
+        return v if printable(v, limit) else ""
+
+    doc = {"generated_at": text("generated_at", 40), "omarchy_version": text("omarchy_version", 40),
+           "label": text("label", 40)}
+    items, errors = [], []
+    for table, kind, title in CATEGORIES:
+        entries = data.get(table, [])
+        if not isinstance(entries, list):
+            errors.append(f"{title}: not a list of entries; skipped")
+            continue
+        if len(entries) > MAX_ITEMS:
+            errors.append(f"{title}: {len(entries)} entries is too many; only the first {MAX_ITEMS} read")
+            entries = entries[:MAX_ITEMS]
+        for n, e in enumerate(entries, 1):
+            if not isinstance(e, dict):
+                errors.append(f"{title} #{n}: not a table; skipped")
+                continue
+            item, err = validate_entry(kind, e)
+            if err:
+                errors.append(f"{title} #{n}: {err}; skipped")
+            else:
+                items.append(item)
+    seen, unique = set(), []
+    for it in items:
+        if it["key"] not in seen:
+            seen.add(it["key"])
+            unique.append(it)
+    return doc, unique, errors
+
+
+def flag(e, name):
+    return e.get(name) is True
+
+
+def validate_entry(kind, e):
+    def s(name, regex, required=True):
+        v = e.get(name, "")
+        if v == "" and not required:
+            return ""
+        if not isinstance(v, str) or not regex.match(v):
+            raise ValueError(f"bad {name} {str(v)[:60]!r}")
+        return v
+
+    try:
+        item = {"kind": kind, "hardware": flag(e, "hardware"), "private": flag(e, "private"),
+                "manual": flag(e, "manual"), "note": ""}
+        if kind == "installer":
+            item["command"] = s("command", INSTALLER_RE)
+            args = e.get("args", [])
+            if not isinstance(args, list) or len(args) > 1 or not all(isinstance(a, str) and ARG_RE.match(a) for a in args):
+                raise ValueError("bad args")
+            pkgs = e.get("packages", [])
+            if not isinstance(pkgs, list) or not pkgs or len(pkgs) > 200 or not all(isinstance(p, str) and PKG_RE.match(p) for p in pkgs):
+                raise ValueError("bad packages")
+            item["args"], item["packages"] = list(args), list(pkgs)
+            item["name"] = item["command"] + ("=" + args[0] if args else "")
+            item["manual"] = False
+        elif kind in ("package", "aur"):
+            item["name"] = s("name", PKG_RE)
+            item["repo"] = s("repo", REMOTE_RE, required=False) if kind == "package" else ""
+            item["manual"] = False
+            # Marked here as well, whatever the list says.
+            item["hardware"] = item["hardware"] or item["repo"] in HARDWARE_REPOS or is_hardware_name(item["name"])
+        elif kind == "flatpak":
+            item["name"] = s("id", FLATPAK_ID_RE)
+            item["remote"] = s("remote", REMOTE_RE)
+            item["manual"] = False
+        elif kind == "theme":
+            item["name"] = s("name", THEME_RE)
+            item["source"] = source_of(e, item)
+        elif kind == "plugin":
+            item["name"] = s("id", ID_RE)
+            label = e.get("name", "")
+            item["label"] = label if printable(label, 80) else ""
+            item["enabled"] = flag(e, "enabled")
+            item["bar"] = flag(e, "bar")
+            item["source"] = source_of(e, item)
+        elif kind == "webapp":
+            item["name"] = s("name", APP_NAME_RE)
+            url = e.get("url", "")
+            err = check_webapp_url(url) if isinstance(url, str) else "bad url"
+            if err:
+                raise ValueError(err)
+            item["url"] = url
+            item["manual"] = False
+        elif kind == "tui":
+            item["name"] = s("name", APP_NAME_RE)
+            cmd = e.get("command", "")
+            if not printable(cmd, 512) or cmd.lstrip().startswith("-"):
+                raise ValueError("bad command")
+            style = e.get("style", "float")
+            if style not in ("float", "tile"):
+                raise ValueError("bad style")
+            item["command"], item["style"] = cmd, style
+            item["icon"] = s("icon", ICON_RE, required=False) or "utilities-terminal"
+            item["manual"] = False
+        elif kind == "appimage":
+            item["name"] = s("name", APPIMAGE_RE)
+            item["manual"] = True
+        item["key"] = f"{kind}:{item['name']}"
+        if not KEY_RE.match(item["key"]):
+            raise ValueError("name has characters Understudy does not accept")
+        return item, ""
+    except ValueError as err:
+        return None, str(err)
+
+
+def source_of(e, item):
+    src = e.get("source", "")
+    if src in ("", None):
+        item["manual"] = True
+        return ""
+    if not isinstance(src, str):
+        raise ValueError("bad source")
+    err = check_url(src) or git_url_check(src)
+    if err:
+        raise ValueError(err)
+    return src
+
+
+# --------------------------------------------------------- the secondary
+
+def default_list_path(cfg):
+    """The newer of the shared folder's list and the last imported copy."""
+    shared = folder_path(cfg) / LIST_NAME
+    candidates = []
+    for p in (shared, IMPORTED):
+        try:
+            if p.is_file():
+                data = tomllib.loads(p.read_text())
+                candidates.append((str(data.get("generated_at", "")), p == shared, p))
+        except (OSError, tomllib.TOMLDecodeError, UnicodeDecodeError):
+            candidates.append(("", p == shared, p))
+    if not candidates:
+        folder = folder_path(cfg)
+        if not folder.is_dir():
+            raise Fail(f"The shared folder {tilde(folder)} does not exist, and nothing has been imported. "
+                       f"Share it with Syncthing (see the README), or copy the list here another way "
+                       f"and run: understudy import PATH", 3)
+        raise Fail(f"No list in {tilde(folder)} yet. Export it on the main laptop, "
+                   f"or copy the list here another way and run: understudy import PATH", 3)
+    candidates.sort()
+    return candidates[-1][2]
+
+
+class Here:
+    """What this machine has, read once."""
+
+    def __init__(self):
+        self.packages = set(lines(["pacman", "-Qq"]) or [])
+        self.repos = set(lines(["pacman-conf", "--repo-list"]) or [])
+        self.sync = {}
+        for line in lines(["pacman", "-Sl"], timeout=60) or []:
+            parts = line.split()
+            if len(parts) >= 2:
+                self.sync.setdefault(parts[1], parts[0])
+        self.imap = installer_map()
+        self.has_yay = have("yay")
+        self.has_flatpak = have("flatpak")
+        self.flatpaks, self.remotes = set(), set()
+        if self.has_flatpak:
+            self.flatpaks = set(lines(["flatpak", "list", "--app", "--columns=application"]) or [])
+            self.remotes = set(lines(["flatpak", "remotes", "--columns=name"]) or [])
+        plist = plugin_list() or []
+        self.plugins = {p.get("id") for p in plist if isinstance(p, dict)} | set(plugin_folders())
+        self.themes = set()
+        for d in (THEMES_DIR, OMARCHY_PATH / "themes"):
+            try:
+                self.themes |= {p.name for p in d.iterdir()}
+            except OSError:
+                pass
+
+    def app_exists(self, name):
+        return (APPS_DIR / f"{name}.desktop").exists() or (OMARCHY_PATH / "applications" / f"{name}.desktop").exists()
+
+    def appimage_exists(self, name):
+        return any((d / name).exists() for d in (HOME / "Applications", HOME / ".local/bin"))
+
+
+def assess(item, here):
+    """Sets status (installed | missing | manual | unavailable) and a note."""
+    kind = item["kind"]
+    status, note = "missing", ""
+    if kind == "installer":
+        pkgs = item["packages"]
+        known = here.imap.get((item["command"], item["args"][0] if item["args"] else ""))
+        if pkgs[0] in here.packages:
+            status = "installed"
+        elif known is None:
+            status, note = "unavailable", "this Omarchy has no such installer"
+        else:
+            note = "sets it up the Omarchy way" + (" (" + ", ".join(known[:4]) + ("…" if len(known) > 4 else "") + ")")
+    elif kind == "package":
+        if item["name"] in here.packages:
+            status = "installed"
+        elif item["repo"] and item["repo"] not in here.repos:
+            status, note = "unavailable", f"needs the [{item['repo']}] repo, which this machine does not have"
+        elif item["name"] not in here.sync:
+            status, note = "unavailable", "not found in this machine's repos"
+        else:
+            note = f"[{here.sync[item['name']]}]"
+    elif kind == "aur":
+        if item["name"] in here.packages:
+            status = "installed"
+        elif not here.has_yay:
+            status, note = "unavailable", "needs yay"
+        else:
+            note = "from the AUR, built with yay"
+    elif kind == "flatpak":
+        if item["name"] in here.flatpaks:
+            status = "installed"
+        elif not here.has_flatpak:
+            status, note = "unavailable", "flatpak is not installed"
+        elif item["remote"] not in here.remotes:
+            status, note = "unavailable", f"needs the {item['remote']} flatpak remote"
+        else:
+            note = f"from {item['remote']}"
+    elif kind == "theme":
+        slug = theme_slug(item["source"]) if item["source"] else item["name"]
+        if item["name"] in here.themes or slug in here.themes:
+            status = "installed"
+        elif item["manual"] or not item["source"]:
+            status, note = "manual", "manual: no source URL"
+        elif not THEME_RE.match(slug):
+            status, note = "unavailable", "its URL does not give a usable theme name"
+        else:
+            note = short_url(item["source"])
+    elif kind == "plugin":
+        if item["name"] in here.plugins:
+            status = "installed"
+        elif item["manual"] or not item["source"]:
+            status, note = "manual", "manual: no source URL"
+        else:
+            note = short_url(item["source"])
+            if item["bar"]:
+                note += " · a whole bar; not switched to"
+            elif item["enabled"]:
+                note += " · turned on, as on main"
+    elif kind == "webapp":
+        status = "installed" if here.app_exists(item["name"]) else "missing"
+        note = item["url"]
+    elif kind == "tui":
+        status = "installed" if here.app_exists(item["name"]) else "missing"
+        note = f"runs `{item['command']}` ({item['style']})"
+    elif kind == "appimage":
+        status = "installed" if here.appimage_exists(item["name"]) else "manual"
+        note = "manual: download it yourself"
+    if item.get("private") and status == "missing":
+        note += " · private repo: needs `gh auth login` here"
+    if item.get("hardware") and status == "missing":
+        note = "hardware-specific · " + note if note else "hardware-specific"
+    item["status"], item["note"] = status, note
+    item["installable"] = status == "missing"
+    return item
+
+
+def short_url(url):
+    return re.sub(r"^https://(www\.)?", "", url)
+
+
+def diff(path):
+    doc, items, errors = load_list(path)
+    here = Here()
+    ignored = read_ignore()
+    for it in items:
+        assess(it, here)
+        it["ignored"] = it["key"] in ignored
+        it["default"] = it["installable"] and not it["hardware"] and not it["ignored"]
+    return doc, items, errors
+
+
+# ----------------------------------------------------------------- the plan
+
+def select(items, only):
+    if only is None:
+        return [it for it in items if it["default"]]
+    wanted = set(only)
+    bad = [k for k in only if not KEY_RE.match(k)]
+    if bad:
+        raise Fail(f"not an item key: {bad[0]!r}", 2)
+    unknown = wanted - {it["key"] for it in items}
+    if unknown:
+        raise Fail(f"not in the list: {sorted(unknown)[0]}", 2)
+    chosen = [it for it in items if it["key"] in wanted]
+    skipped = [it for it in chosen if not it["installable"]]
+    if skipped:
+        it = skipped[0]
+        raise Fail(f"{it['key']} cannot be installed here ({it['status']}{': ' + it['note'] if it['note'] else ''})", 2)
+    return chosen
+
+
+def build_plan(chosen):
+    """Groups of steps, in install order. Each step has argv (an argument
+    array, never a shell string), the item keys it covers, and a check that
+    says whether it is already done."""
+    groups = []
+    for table, kind, title in CATEGORIES:
+        mine = [it for it in chosen if it["kind"] == kind]
+        if not mine:
+            continue
+        steps = []
+        if kind == "installer":
+            for it in mine:
+                steps.append({"argv": [it["command"]] + it["args"], "keys": [it["key"]], "item": it})
+        elif kind == "package":
+            steps.append({"argv": ["omarchy-pkg-add"] + [it["name"] for it in mine],
+                          "keys": [it["key"] for it in mine], "items": mine})
+        elif kind == "aur":
+            steps.append({"argv": ["omarchy-pkg-aur-add"] + [it["name"] for it in mine],
+                          "keys": [it["key"] for it in mine], "items": mine})
+        elif kind == "flatpak":
+            for it in mine:
+                steps.append({"argv": ["flatpak", "install", it["remote"], it["name"]], "keys": [it["key"]], "item": it})
+        elif kind == "theme":
+            for it in mine:
+                steps.append({"argv": ["omarchy-theme-install", it["source"]], "keys": [it["key"]], "item": it,
+                              "restore_theme": True})
+        elif kind == "plugin":
+            for it in mine:
+                steps.append({"argv": ["omarchy-plugin-add", it["source"], "--yes"], "keys": [it["key"]], "item": it})
+                if it["enabled"] and not it["bar"]:
+                    steps.append({"argv": ["omarchy-plugin-enable", it["name"]], "keys": [it["key"]], "item": it,
+                                  "after_add": it["name"]})
+        elif kind == "webapp":
+            # An empty icon makes omarchy-webapp-install fetch the site's own.
+            for it in mine:
+                steps.append({"argv": ["omarchy-webapp-install", it["name"], it["url"], ""], "keys": [it["key"]], "item": it})
+        elif kind == "tui":
+            for it in mine:
+                steps.append({"argv": ["omarchy-tui-install", it["name"], it["command"], it["style"], it["icon"]],
+                              "keys": [it["key"]], "item": it})
+        groups.append({"title": title, "kind": kind, "steps": steps})
+    return groups
+
+
+def shown(argv):
+    return shlex.join(argv)
+
+
+def plan_text(groups, list_path, doc, errors):
+    out = [f"Understudy plan from {tilde(list_path)} (label {doc['label'] or '?'}, {doc['generated_at'] or 'undated'})", ""]
+    if not groups:
+        out.append("Nothing to install.")
+    prev = current_theme()
+    for g in groups:
+        out.append(f"{g['title']}:")
+        for st in g["steps"]:
+            out.append("  $ " + shown(st["argv"]))
+            if st.get("restore_theme") and prev[0]:
+                out.append(f"    then switch back to the {prev[0]} theme and its background")
+        out.append("")
+    if errors:
+        out.append(f"Skipped {len(errors)} entr{'y' if len(errors) == 1 else 'ies'} the list got wrong:")
+        out += ["  " + e for e in errors]
+        out.append("")
+    return "\n".join(out).rstrip() + "\n"
+
+
+def plan_json(groups):
+    return [{"title": g["title"], "kind": g["kind"],
+             "commands": [shown(st["argv"]) for st in g["steps"]],
+             "keys": sorted({k for st in g["steps"] for k in st["keys"]})} for g in groups]
+
+
+# -------------------------------------------------------------------- apply
+
+def current_theme():
+    try:
+        name = CURRENT_THEME.read_text().strip()
+    except OSError:
+        name = ""
+    try:
+        bg = os.readlink(CURRENT_BG)
+    except OSError:
+        bg = ""
+    return name, bg
+
+
+def restore_theme(prev):
+    name, bg = prev
+    if not name:
+        return True
+    now, now_bg = current_theme()
+    ok = True
+    if now != name:
+        ok = subprocess.call(["omarchy-theme-set", name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0
+    now, now_bg = current_theme()
+    if bg and now_bg != bg and Path(bg).is_file():
+        subprocess.call(["omarchy-theme-bg-set", bg], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return ok
+
+
+def already_done(step, here_fresh):
+    """Re-checks right before a step runs, since an earlier installer may
+    have done it already (Tailscale's installer makes its web app)."""
+    kind = step.get("item", {}).get("kind") if step.get("item") else None
+    if step.get("after_add"):
+        return False
+    if kind == "theme":
+        it = step["item"]
+        slug = theme_slug(it["source"])
+        return (THEMES_DIR / slug).exists() or (THEMES_DIR / it["name"]).exists()
+    if kind == "plugin":
+        return step["item"]["name"] in here_fresh().plugins
+    if kind in ("webapp", "tui"):
+        return here_fresh().app_exists(step["item"]["name"])
+    if kind == "installer":
+        return step["item"]["packages"][0] in set(lines(["pacman", "-Qq"]) or [])
+    return False
+
+
+def wait_for_plugin(pid, tries=40):
+    """The shell's entry for a plugin just added, once it has rescanned, or
+    None. `omarchy plugin enable` only knows the id after that."""
+    import time
+    for _ in range(tries):
+        for p in plugin_list() or []:
+            if isinstance(p, dict) and p.get("id") == pid:
+                return p
+        time.sleep(0.25)
+    return None
+
+
+def apply(list_path, only, hold):
+    doc, items, errors = diff(list_path)
+    chosen = select(items, only)
+    groups = build_plan(chosen)
+    sys.stdout.write(plan_text(groups, list_path, doc, errors))
+    if not groups:
+        return finish(0, hold)
+    sys.stdout.write("Nothing is removed or replaced; anything already here is skipped.\n")
+    sys.stdout.write("Continue? [y/N] ")
+    sys.stdout.flush()
+    answer = sys.stdin.readline().strip().lower()
+    if answer not in ("y", "yes"):
+        print("Nothing installed.")
+        return finish(1, hold)
+
+    cache = {}
+
+    def here_fresh():
+        cache["here"] = Here()
+        return cache["here"]
+
+    done, skipped, failed = [], [], None
+    prev = current_theme()
+    for g in groups:
+        print(f"\n== {g['title']} ==")
+        for st in g["steps"]:
+            if already_done(st, here_fresh):
+                print(f"-- already here, skipped: {', '.join(st['keys'])}")
+                skipped += st["keys"]
+                continue
+            if st.get("after_add"):
+                entry = wait_for_plugin(st["after_add"])
+                if entry is None:
+                    print(f"-- {st['after_add']} is installed but the shell has not picked it up yet; "
+                          f"turn it on later with: omarchy plugin enable {st['after_add']}")
+                    continue
+                # The list's bar flag is only a hint; what was installed decides.
+                if "bar" in (entry.get("kinds") or []):
+                    print(f"-- {st['after_add']} is a whole bar; not switched to (pick it in Barkeep if you want it)")
+                    continue
+            print("$ " + shown(st["argv"]), flush=True)
+            try:
+                rc = subprocess.call(st["argv"])
+            except OSError as e:
+                print(f"understudy: could not run {st['argv'][0]}: {e}")
+                rc = 127
+            if st.get("restore_theme"):
+                if not restore_theme(prev):
+                    print(f"-- could not switch back to the {prev[0]} theme; pick it in the theme switcher")
+            if rc != 0:
+                failed = (st, rc)
+                break
+            done += [k for k in st["keys"] if k not in done]
+        if failed:
+            break
+
+    print("\n== Summary ==")
+    print(f"Installed: {len(done)}" + (f"  ({', '.join(done)})" if done else ""))
+    if skipped:
+        print(f"Already here: {len(skipped)}")
+    if failed:
+        st, rc = failed
+        print(f"Stopped: `{shown(st['argv'])}` exited {rc}. Nothing after it ran.")
+        return finish(1, hold)
+    print("Done.")
+    return finish(0, hold)
+
+
+def finish(rc, hold):
+    if hold:
+        sys.stdout.write("\nPress Enter to close.")
+        sys.stdout.flush()
+        try:
+            sys.stdin.readline()
+        except (OSError, KeyboardInterrupt):
+            pass
+    return rc
+
+
+def open_terminal(list_path, only):
+    # Validate before opening anything, so a bad request fails here, not in a
+    # terminal window.
+    doc, items, errors = diff(list_path)
+    chosen = select(items, only)
+    if not chosen:
+        raise Fail("Nothing is ticked to install.")
+    me = str(Path(__file__).resolve())
+    argv = ["setsid", "uwsm-app", "--", "xdg-terminal-exec", "--app-id=org.omarchy.terminal", "--title=Understudy",
+            "-e", "/usr/bin/python3", "-I", "-S", me, "apply", "--hold", "--list", str(list_path),
+            "--only"] + [it["key"] for it in chosen]
+    subprocess.Popen(argv, start_new_session=True, stdin=subprocess.DEVNULL,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    print(f"Opened a terminal to install {len(chosen)} item{'s' if len(chosen) != 1 else ''}.")
+    return 0
+
+
+# ----------------------------------------------------------------- commands
+
+def item_summary(found):
+    return {kind: len(found.get(table) or []) for table, kind, _ in CATEGORIES}
+
+
+def scan_rows(found):
+    rows = []
+    for table, kind, title in CATEGORIES:
+        for it in found.get(table) or []:
+            name = it.get("id") or it.get("name") or (it["command"] + (" " + it["args"][0] if it.get("args") else ""))
+            notes = []
+            if kind == "installer":
+                notes.append("covers " + ", ".join(it["packages"][:4]) + ("…" if len(it["packages"]) > 4 else ""))
+            if kind == "package" and it.get("repo"):
+                notes.append(f"[{it['repo']}]")
+            if kind == "flatpak":
+                notes.append(f"from {it['remote']}")
+            if it.get("hardware"):
+                notes.append("hardware-specific")
+            if it.get("manual"):
+                notes.append("manual: no source URL" if kind != "appimage" else "manual")
+            if it.get("private"):
+                notes.append("private repo")
+            if kind == "plugin":
+                notes.append("enabled" if it.get("enabled") else "not enabled")
+            if it.get("source"):
+                notes.append(short_url(it["source"]))
+            if kind == "webapp":
+                notes.append(it["url"])
+            if kind == "tui":
+                notes.append(it["command"])
+            rows.append({"kind": kind, "name": name, "note": " · ".join(notes)})
+    return rows
+
+
+def cmd_scan(args):
+    offline = "--offline" in args
+    as_json = "--json" in args
+    found = scan(offline=offline)
+    if as_json:
+        print(json.dumps({"counts": item_summary(found), "packages": found["counts"],
+                          "first_install": found["first_install"], "omarchy_version": found["omarchy_version"],
+                          "rows": scan_rows(found), "warnings": found["warnings"]}))
+        return 0
+    print(f"Omarchy {found['omarchy_version']}, first installed {found['first_install'] or 'on an unknown date'}.")
+    c = found["counts"]
+    print(f"{c['explicit']} explicit packages, {c['beyond_defaults']} beyond Omarchy's defaults, {c['foreign']} from the AUR.\n")
+    for table, kind, title in CATEGORIES:
+        items = [r for r in scan_rows(found) if r["kind"] == kind]
+        print(f"{title}: {len(items)}")
+        for r in items:
+            print(f"  {r['name']}" + (f"  ({r['note']})" if r["note"] else ""))
+    for w in found["warnings"]:
+        print("warning: " + w)
+    return 0
+
+
+def resolve_export_path(arg, cfg):
+    if arg:
+        p = expand(arg)
+        if not p.is_absolute():
+            p = Path.cwd() / p
+        if p.is_dir():
+            p = p / LIST_NAME
+        if not p.parent.is_dir():
+            raise Fail(f"{tilde(p.parent)} does not exist.")
+        return p
+    folder = folder_path(cfg)
+    if not folder.is_dir():
+        raise Fail(f"The shared folder {tilde(folder)} does not exist. Create it and share it with Syncthing "
+                   f"(see the README), or export somewhere else: understudy export PATH", 3)
+    return folder / LIST_NAME
+
+
+def cmd_export(args):
+    cfg = read_config()
+    path_arg = next((a for a in args if not a.startswith("--")), "")
+    target = resolve_export_path(path_arg, cfg)
+    if target.exists() and "--force" not in args:
+        try:
+            if tomllib.loads(target.read_text()).get("format") != FORMAT:
+                raise ValueError
+        except (OSError, ValueError, tomllib.TOMLDecodeError, UnicodeDecodeError):
+            raise Fail(f"{tilde(target)} exists and is not an Understudy list; not overwritten (--force to replace it).")
+    found = scan(offline="--offline" in args)
+    text = render_list(list_doc(found, cfg["label"]))
+    # Never write what could not be read back the same way.
+    if tomllib.loads(text).get("format") != FORMAT:
+        raise Fail("internal error: the list did not read back")
+    atomic_write(target, text)
+    counts = item_summary(found)
+    total = sum(counts.values())
+    if "--json" in args:
+        print(json.dumps({"path": str(target), "counts": counts, "warnings": found["warnings"]}))
+    else:
+        print(f"Wrote {total} items to {tilde(target)}.")
+        for w in found["warnings"]:
+            print("warning: " + w)
+    return 0
+
+
+def cmd_import(args):
+    cfg = read_config()
+    src = expand(args[0]) if args else folder_path(cfg) / LIST_NAME
+    if args and not src.is_absolute():
+        src = Path.cwd() / src
+    if src.is_dir():
+        src = src / LIST_NAME
+    if not args and not folder_path(cfg).is_dir():
+        raise Fail(f"The shared folder {tilde(folder_path(cfg))} does not exist. "
+                   f"Copy the list here another way and run: understudy import PATH", 3)
+    doc, items, errors = load_list(src)
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    with open(src, "rb") as f:
+        raw = f.read(MAX_LIST_BYTES)
+    atomic_write(IMPORTED, raw.decode("utf-8"))
+    print(f"Imported {len(items)} items from {tilde(src)} (label {doc['label'] or '?'}, {doc['generated_at'] or 'undated'}).")
+    for e in errors:
+        print("skipped: " + e)
+    return 0
+
+
+def parse_common(args):
+    list_path, only, rest, i = None, None, [], 0
+    while i < len(args):
+        a = args[i]
+        if a == "--list":
+            if i + 1 >= len(args):
+                raise Fail("--list needs a path", 2)
+            list_path = expand(args[i + 1])
+            i += 2
+            continue
+        if a == "--only":
+            only = list(args[i + 1:])
+            break
+        rest.append(a)
+        i += 1
+    if list_path is None:
+        list_path = default_list_path(read_config())
+    return list_path, only, rest
+
+
+def cmd_diff(args):
+    list_path, _, rest = parse_common(args)
+    doc, items, errors = diff(list_path)
+    if "--json" in rest:
+        print(json.dumps({"list": {"path": str(list_path), **doc}, "errors": errors,
+                          "items": [{k: it.get(k) for k in ("key", "kind", "name", "label", "status", "note",
+                                                             "installable", "default", "ignored", "hardware", "private")}
+                                    for it in items]}))
+        return 0
+    print(f"List {tilde(list_path)} (label {doc['label'] or '?'}, {doc['generated_at'] or 'undated'})")
+    for table, kind, title in CATEGORIES:
+        mine = [it for it in items if it["kind"] == kind and it["status"] != "installed"]
+        if not mine:
+            continue
+        print(f"\n{title}:")
+        for it in mine:
+            box = "[x]" if it["default"] else "[ ]"
+            if not it["installable"]:
+                box = " - "
+            print(f"  {box} {it['name']}" + (f"  ({it['note']})" if it["note"] else "") + ("  [ignored]" if it["ignored"] else ""))
+    installed = sum(1 for it in items if it["status"] == "installed")
+    print(f"\n{installed} already here.")
+    for e in errors:
+        print("error: " + e)
+    return 0
+
+
+def cmd_plan(args):
+    list_path, only, rest = parse_common(args)
+    doc, items, errors = diff(list_path)
+    groups = build_plan(select(items, only))
+    if "--json" in rest:
+        print(json.dumps({"groups": plan_json(groups), "text": plan_text(groups, list_path, doc, errors)}))
+    else:
+        sys.stdout.write(plan_text(groups, list_path, doc, errors))
+    return 0
+
+
+def cmd_apply(args):
+    list_path, only, rest = parse_common(args)
+    return apply(list_path, only, "--hold" in rest)
+
+
+def cmd_terminal(args):
+    list_path, only, _ = parse_common(args)
+    return open_terminal(list_path, only)
+
+
+def cmd_role(args):
+    cfg = read_config()
+    if not args:
+        print(cfg["role"] or "unset")
+        return 0
+    if args[0] not in ("main", "secondary"):
+        raise Fail("role is main or secondary", 2)
+    cfg["role"] = args[0]
+    write_config(cfg)
+    print(f"This machine is now the {args[0]}.")
+    return 0
+
+
+def cmd_config(args):
+    cfg = read_config()
+    if not args:
+        print(json.dumps(cfg))
+        return 0
+    if len(args) != 2:
+        raise Fail("usage: understudy config folder PATH | label NAME | auto-export on|off", 2)
+    key, value = args
+    if key == "folder":
+        if not printable(value, 512) or not (value.startswith("/") or value.startswith("~/")):
+            raise Fail("the folder must be an absolute path or start with ~/", 2)
+        cfg["folder"] = value
+    elif key == "label":
+        if not re.match(r"^[A-Za-z0-9][A-Za-z0-9 ._-]{0,39}$", value):
+            raise Fail("a label is up to 40 letters, digits, spaces, dots, dashes or underscores", 2)
+        cfg["label"] = value
+    elif key == "auto-export":
+        if value not in ("on", "off"):
+            raise Fail("auto-export is on or off", 2)
+        cfg["auto_export"] = value == "on"
+    else:
+        raise Fail(f"unknown setting {key!r}", 2)
+    write_config(cfg)
+    print(f"{key} set.")
+    return 0
+
+
+def cmd_status(args):
+    cfg = read_config()
+    folder = folder_path(cfg)
+    shared = folder / LIST_NAME
+    info = {
+        "role": cfg["role"], "folder": cfg["folder"], "folderPath": str(folder), "folderExists": folder.is_dir(),
+        "listPath": str(shared), "listExists": shared.is_file(), "importedExists": IMPORTED.is_file(),
+        "label": cfg["label"], "autoExport": cfg["auto_export"], "configPath": str(CONFIG_FILE),
+    }
+    for p, k in ((shared, "listGeneratedAt"), (IMPORTED, "importedGeneratedAt")):
+        try:
+            info[k] = str(tomllib.loads(p.read_text()).get("generated_at", ""))[:40]
+        except (OSError, tomllib.TOMLDecodeError, UnicodeDecodeError):
+            info[k] = ""
+    if "--json" in args:
+        print(json.dumps(info))
+    else:
+        print(f"role: {info['role'] or 'unset'}")
+        print(f"folder: {cfg['folder']}" + ("" if info["folderExists"] else " (does not exist)"))
+        print(f"list: {'present' if info['listExists'] else 'none'}" + (f", {info['listGeneratedAt']}" if info["listGeneratedAt"] else ""))
+        print(f"imported copy: {'present' if info['importedExists'] else 'none'}")
+        print(f"label: {cfg['label']}   auto-export: {'on' if cfg['auto_export'] else 'off'}")
+    return 0
+
+
+def cmd_ignore(args, add):
+    if not args:
+        raise Fail("name at least one item key, like package:btop", 2)
+    for k in args:
+        if not KEY_RE.match(k):
+            raise Fail(f"not an item key: {k!r}", 2)
+    keys = read_ignore()
+    keys = keys | set(args) if add else keys - set(args)
+    write_ignore(keys)
+    return 0
+
+
+def main(argv):
+    cmd, args = (argv[0], argv[1:]) if argv else ("toggle", [])
+    try:
+        if cmd == "toggle":
+            os.execvp("omarchy-shell", ["omarchy-shell", "shell", "toggle", SELF_ID, "{}"])
+        handlers = {
+            "role": cmd_role, "status": cmd_status, "config": cmd_config, "scan": cmd_scan,
+            "export": cmd_export, "import": cmd_import, "diff": cmd_diff, "plan": cmd_plan,
+            "apply": cmd_apply, "terminal": cmd_terminal,
+            "ignore": lambda a: cmd_ignore(a, True), "unignore": lambda a: cmd_ignore(a, False),
+        }
+        if cmd in ("-h", "--help", "help"):
+            print(__doc__.split("\n\n")[1])
+            return 0
+        if cmd not in handlers:
+            raise Fail(f"unknown command {cmd!r} (understudy --help)", 2)
+        return handlers[cmd](args)
+    except Fail as e:
+        print(f"understudy: {e}", file=sys.stderr)
+        return e.code
+    except KeyboardInterrupt:
+        print("\nunderstudy: stopped.", file=sys.stderr)
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

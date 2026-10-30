@@ -1,0 +1,32 @@
+Understudy plan from ~/Sync/understudy/understudy.toml (label tuf, 2026-10-30T12:00:00Z)
+
+Omarchy installers:
+  $ omarchy-install-browser brave
+  $ omarchy-install-gaming-steam
+
+Repo packages:
+  $ omarchy-pkg-add rclone restic
+
+AUR packages:
+  $ omarchy-pkg-aur-add my-aur-tool
+
+Flatpaks:
+  $ flatpak install flathub com.example.Tool
+
+Themes:
+  $ omarchy-theme-install https://github.com/someone/omarchy-sunset-theme.git
+    then switch back to the tokyo-night theme and its background
+  $ omarchy-theme-install https://github.com/someone/omarchy-private-theme.git
+    then switch back to the tokyo-night theme and its background
+
+Plugins:
+  $ omarchy-plugin-add https://github.com/acme/omarchy-weather.git --yes
+  $ omarchy-plugin-enable acme.weather
+  $ omarchy-plugin-add https://github.com/acme/off.git --yes
+  $ omarchy-plugin-add git@github.com:acme/tallbar.git --yes
+
+Web apps:
+  $ omarchy-webapp-install Notes https://notes.example.com/app ''
+
+TUI launchers:
+  $ omarchy-tui-install Top btop float utilities-terminal
